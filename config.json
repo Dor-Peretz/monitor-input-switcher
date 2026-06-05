@@ -1,0 +1,35 @@
+{
+  "version": 2,
+  "monitor_bindings": [
+    {
+      "enabled": true,
+      "monitor": "right",
+      "device": "\\\\.\\DISPLAY2",
+      "hotkey": "ctrl+alt+shift+R",
+      "input_a": 15,
+      "input_b": 27
+    }
+  ],
+  "pc_switch": {
+    "enabled": true,
+    "hotkey": "ctrl+shift+1",
+    "pc_a_name": "Laptop",
+    "pc_b_name": "Desktop",
+    "monitors": [
+      {
+        "enabled": true,
+        "monitor": "left",
+        "device": "\\\\.\\DISPLAY3",
+        "input_a": 15,
+        "input_b": 27
+      },
+      {
+        "enabled": true,
+        "monitor": "right",
+        "device": "\\\\.\\DISPLAY2",
+        "input_a": 15,
+        "input_b": 27
+      }
+    ]
+  }
+}
