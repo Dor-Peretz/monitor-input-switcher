@@ -1,10 +1,24 @@
+# Runtime state
 .switcher_state.json
 switcher_state.json
-tray.log
-tray_icon.ico
-__pycache__/
-*.pyc
-*.pyo
+
+# Logs
+*.log
+
+# Personal config (macOS auto-creates config.json from config.example.json)
+macos/config.json
+config.json.bak.*
+
+# Build / packaging artifacts
 build/
 dist/
 *.spec.bak
+MonitorInputSwitcher-macos-*/
+MonitorInputSwitcher-macos-*.zip
+
+# Python / env
+tray_icon.ico
+.venv/
+__pycache__/
+*.pyc
+*.pyo

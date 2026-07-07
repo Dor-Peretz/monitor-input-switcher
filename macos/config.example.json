@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "monitor_bindings": [],
+  "pc_switch": {
+    "enabled": false,
+    "hotkey": "cmd+shift+1",
+    "pc_a_name": "PC 1",
+    "pc_b_name": "PC 2",
+    "monitors": []
+  }
+}

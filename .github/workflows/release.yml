@@ -48,3 +48,36 @@ jobs:
           files: |
             dist/MonitorInputSwitcher.exe
             dist/MonitorInputSwitcher-v${{ steps.version.outputs.version }}-win64.zip
+
+  build-macos:
+    needs: build-windows
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "version=$(python -c 'from version import __version__; print(__version__)')" >> "$GITHUB_OUTPUT"
+
+      - name: Package macOS bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          staging="MonitorInputSwitcher-macos-v$version"
+          mkdir -p "$staging"
+          cp macos/*.py macos/*.sh macos/requirements.txt macos/README.md macos/config.example.json "$staging"/
+          zip -r "$staging.zip" "$staging"
+          echo "ZIP_PATH=$staging.zip" >> "$GITHUB_ENV"
+
+      - name: Upload macOS bundle to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_PATH }}
