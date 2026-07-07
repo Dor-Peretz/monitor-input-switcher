@@ -14,6 +14,14 @@ from config_store import (
     save_config,
 )
 from ddc_monitor import MonitorInfo, enumerate_monitors, read_active_pc
+from hardware_info import (
+    DELL_DISPLAY_MANAGER_URL,
+    controllable_reason,
+    enrich_monitor,
+    get_pnp_monitors,
+    open_device_manager_monitors,
+    open_driver_page,
+)
 from hotkey_service import HotkeyService, format_hotkey
 
 
@@ -90,6 +98,8 @@ class MonitorSwitcherUI:
 
         self.service = HotkeyService() if not settings_only else None
         self.monitors: list[MonitorInfo] = []
+        self.monitor_extra: dict[str, dict] = {}
+        self.pnp_monitors = []
         self.config = load_config()
         self.monitor_rows: list[dict] = []
         self.pc_rows: list[dict] = []
@@ -114,11 +124,14 @@ class MonitorSwitcherUI:
 
         self.monitor_tab = ttk.Frame(notebook, padding=10)
         self.pc_tab = ttk.Frame(notebook, padding=10)
+        self.drivers_tab = ttk.Frame(notebook, padding=10)
         notebook.add(self.monitor_tab, text="Per Monitor")
         notebook.add(self.pc_tab, text="PC Switch (Group)")
+        notebook.add(self.drivers_tab, text="Drivers")
 
         self._build_monitor_tab()
         self._build_pc_tab()
+        self._build_drivers_tab()
 
         footer = ttk.Frame(self.root, padding=10)
         footer.pack(fill="x")
@@ -160,7 +173,11 @@ class MonitorSwitcherUI:
         toolbar.pack(fill="x", pady=(0, 8))
         ttk.Label(
             toolbar,
-            text="Each row toggles one monitor between two inputs when its shortcut is pressed.",
+            text=(
+                "All detected displays are listed. Only switchable monitors can be "
+                "configured — others show why they are unavailable."
+            ),
+            wraplength=860,
         ).pack(anchor="w")
 
         container = ttk.Frame(self.monitor_tab)
@@ -225,6 +242,35 @@ class MonitorSwitcherUI:
         self.pc_rows_frame = ttk.Frame(self.pc_tab)
         self.pc_rows_frame.pack(fill="both", expand=True)
 
+    def _build_drivers_tab(self) -> None:
+        intro = ttk.Frame(self.drivers_tab)
+        intro.pack(fill="x", pady=(0, 8))
+        ttk.Label(
+            intro,
+            text=(
+                "Windows hardware detection and Dell driver links. "
+                "Install the monitor driver if a screen shows as Generic PnP, "
+                "then enable DDC/CI in the monitor menu."
+            ),
+            wraplength=860,
+        ).pack(anchor="w")
+
+        buttons = ttk.Frame(intro)
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(
+            buttons,
+            text="Open Device Manager",
+            command=open_device_manager_monitors,
+        ).pack(side="left")
+        ttk.Button(
+            buttons,
+            text="Dell Display Manager",
+            command=lambda: open_driver_page(DELL_DISPLAY_MANAGER_URL),
+        ).pack(side="left", padx=(8, 0))
+
+        self.drivers_frame = ttk.Frame(self.drivers_tab)
+        self.drivers_frame.pack(fill="both", expand=True)
+
     def _input_combobox(self, parent, value: int) -> ttk.Combobox:
         labels = [label for label, _code in INPUT_CHOICES]
         combo = ttk.Combobox(parent, values=labels, state="readonly", width=24)
@@ -233,9 +279,15 @@ class MonitorSwitcherUI:
 
     def refresh_monitors(self) -> None:
         self.monitors = enumerate_monitors()
+        self.pnp_monitors = get_pnp_monitors()
+        self.monitor_extra = {
+            monitor.device_name: enrich_monitor(monitor, self.pnp_monitors)
+            for monitor in self.monitors
+        }
         controllable = [monitor for monitor in self.monitors if monitor.controllable]
-        self._render_monitor_rows(controllable)
-        self._render_pc_rows(controllable)
+        self._render_monitor_rows(self.monitors)
+        self._render_pc_rows(self.monitors)
+        self._render_drivers_tab()
         self._load_into_form()
         self.active_pc_var.set(
             f"Active PC: {read_active_pc()} (will flip on next PC hotkey)"
@@ -258,15 +310,28 @@ class MonitorSwitcherUI:
         }
 
         for monitor in monitors:
+            extra = self.monitor_extra.get(monitor.device_name, {})
             saved_entry = saved.get(monitor.device_name) or saved.get(monitor.position, {})
-            row_frame = ttk.Frame(self.monitor_rows_frame, padding=(0, 6))
+            switchable = monitor.controllable
+            reason = controllable_reason(monitor, extra)
+
+            block = ttk.Frame(self.monitor_rows_frame, padding=(0, 8))
+            block.pack(fill="x")
+
+            row_frame = ttk.Frame(block)
             row_frame.pack(fill="x")
 
-            enabled = tk.BooleanVar(value=saved_entry.get("enabled", False))
-            ttk.Checkbutton(row_frame, variable=enabled).pack(side="left", padx=(0, 8))
+            enabled_default = switchable and saved_entry.get("enabled", False)
+            enabled = tk.BooleanVar(value=enabled_default)
+            enable_box = ttk.Checkbutton(row_frame, variable=enabled)
+            enable_box.pack(side="left", padx=(0, 8))
+            if not switchable:
+                enable_box.configure(state="disabled")
 
-            label = f"[{monitor.position}] {monitor.description}"
-            ttk.Label(row_frame, text=label, width=42).pack(side="left")
+            model = extra.get("detected_model") or monitor.description
+            status = "switchable" if switchable else "not switchable"
+            label = f"[{monitor.position}] {model} — {status}"
+            ttk.Label(row_frame, text=label, width=52).pack(side="left")
 
             ttk.Label(row_frame, text="Hotkey").pack(side="left", padx=(8, 4))
             hotkey = HotkeyCapture(row_frame, width=18)
@@ -286,6 +351,23 @@ class MonitorSwitcherUI:
             )
             input_b.pack(side="left")
 
+            if not switchable:
+                hotkey.configure(state="disabled")
+                input_a.configure(state="disabled")
+                input_b.configure(state="disabled")
+
+            detail = ttk.Label(block, text=reason, wraplength=860, foreground="#555")
+            detail.pack(anchor="w", padx=(28, 0))
+
+            if extra.get("driver_url"):
+                driver_row = ttk.Frame(block)
+                driver_row.pack(anchor="w", padx=(28, 0), pady=(4, 0))
+                ttk.Button(
+                    driver_row,
+                    text=f"Download driver ({extra.get('detected_model', 'Dell')})",
+                    command=lambda url=extra["driver_url"]: open_driver_page(url),
+                ).pack(side="left")
+
             self.monitor_rows.append(
                 {
                     "monitor": monitor,
@@ -293,13 +375,14 @@ class MonitorSwitcherUI:
                     "hotkey": hotkey,
                     "input_a": input_a,
                     "input_b": input_b,
+                    "switchable": switchable,
                 }
             )
 
         if not monitors:
             ttk.Label(
                 self.monitor_rows_frame,
-                text="No DDC/CI monitors found. Enable DDC/CI in the monitor OSD.",
+                text="No displays detected.",
             ).pack(anchor="w")
 
     def _render_pc_rows(self, monitors: list[MonitorInfo]) -> None:
@@ -312,17 +395,29 @@ class MonitorSwitcherUI:
         }
 
         for monitor in monitors:
+            extra = self.monitor_extra.get(monitor.device_name, {})
             saved_entry = saved.get(monitor.device_name) or saved.get(monitor.position, {})
-            row_frame = ttk.Frame(self.pc_rows_frame, padding=(0, 6))
+            switchable = monitor.controllable
+            model = extra.get("detected_model") or monitor.description
+
+            block = ttk.Frame(self.pc_rows_frame, padding=(0, 8))
+            block.pack(fill="x")
+
+            row_frame = ttk.Frame(block)
             row_frame.pack(fill="x")
 
-            enabled = tk.BooleanVar(value=saved_entry.get("enabled", True))
-            ttk.Checkbutton(row_frame, variable=enabled).pack(side="left", padx=(0, 8))
+            enabled_default = switchable and saved_entry.get("enabled", True)
+            enabled = tk.BooleanVar(value=enabled_default)
+            include_box = ttk.Checkbutton(row_frame, variable=enabled)
+            include_box.pack(side="left", padx=(0, 8))
+            if not switchable:
+                include_box.configure(state="disabled")
 
+            status = "switchable" if switchable else "not switchable"
             ttk.Label(
                 row_frame,
-                text=f"[{monitor.position}] {monitor.description}",
-                width=34,
+                text=f"[{monitor.position}] {model} — {status}",
+                width=40,
             ).pack(side="left")
 
             input_a = self._input_combobox(
@@ -335,14 +430,73 @@ class MonitorSwitcherUI:
             )
             input_b.pack(side="left")
 
+            if not switchable:
+                input_a.configure(state="disabled")
+                input_b.configure(state="disabled")
+
+            ttk.Label(
+                block,
+                text=controllable_reason(monitor, extra),
+                wraplength=860,
+                foreground="#555",
+            ).pack(anchor="w", padx=(28, 0))
+
             self.pc_rows.append(
                 {
                     "monitor": monitor,
                     "enabled": enabled,
                     "input_a": input_a,
                     "input_b": input_b,
+                    "switchable": switchable,
                 }
             )
+
+    def _render_drivers_tab(self) -> None:
+        self._clear_frame(self.drivers_frame)
+
+        if not self.pnp_monitors:
+            ttk.Label(
+                self.drivers_frame,
+                text="Could not query Windows for monitor hardware.",
+            ).pack(anchor="w")
+            return
+
+        for pnp in self.pnp_monitors:
+            block = ttk.LabelFrame(
+                self.drivers_frame,
+                text=pnp.detected_model or pnp.name,
+                padding=10,
+            )
+            block.pack(fill="x", pady=(0, 8))
+
+            driver_status = (
+                "Generic Windows driver"
+                if pnp.uses_generic_driver
+                else "Manufacturer driver detected"
+            )
+            ttk.Label(block, text=f"Windows name: {pnp.name}").pack(anchor="w")
+            ttk.Label(block, text=f"Hardware ID: {pnp.hardware_id or 'unknown'}").pack(
+                anchor="w"
+            )
+            ttk.Label(block, text=f"Driver status: {driver_status}").pack(anchor="w")
+            if pnp.driver_notes:
+                ttk.Label(block, text=pnp.driver_notes, wraplength=820).pack(
+                    anchor="w", pady=(4, 0)
+                )
+
+            row = ttk.Frame(block)
+            row.pack(anchor="w", pady=(8, 0))
+            if pnp.driver_url:
+                ttk.Button(
+                    row,
+                    text="Download Dell driver",
+                    command=lambda url=pnp.driver_url: open_driver_page(url),
+                ).pack(side="left")
+            else:
+                ttk.Label(
+                    row,
+                    text="No known Dell driver mapping for this hardware ID.",
+                ).pack(side="left")
 
     def _load_into_form(self) -> None:
         pc_switch = self.config.get("pc_switch", {})
@@ -360,6 +514,8 @@ class MonitorSwitcherUI:
     def build_config_from_form(self) -> dict:
         monitor_bindings = []
         for row in self.monitor_rows:
+            if not row.get("switchable", True):
+                continue
             monitor: MonitorInfo = row["monitor"]
             hotkey = row["hotkey"].get().strip()
             if row["enabled"].get() and hotkey and hotkey != "Press shortcut...":
@@ -377,6 +533,8 @@ class MonitorSwitcherUI:
         pc_monitors = []
         for row in self.pc_rows:
             monitor = row["monitor"]
+            if not row.get("switchable", True):
+                continue
             pc_monitors.append(
                 {
                     "enabled": row["enabled"].get(),

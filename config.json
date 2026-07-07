@@ -13,15 +13,22 @@
   "pc_switch": {
     "enabled": true,
     "hotkey": "ctrl+shift+1",
-    "pc_a_name": "Laptop",
-    "pc_b_name": "Desktop",
+    "pc_a_name": "Desktop",
+    "pc_b_name": "Laptop",
     "monitors": [
       {
-        "enabled": true,
+        "enabled": false,
         "monitor": "left",
         "device": "\\\\.\\DISPLAY3",
         "input_a": 15,
         "input_b": 27
+      },
+      {
+        "enabled": true,
+        "monitor": "center",
+        "device": "\\\\.\\DISPLAY1",
+        "input_a": 15,
+        "input_b": 17
       },
       {
         "enabled": true,

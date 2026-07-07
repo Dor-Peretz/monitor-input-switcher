@@ -64,19 +64,36 @@ class MonitorInfo:
         )
 
 
+def _decode_vcp_input(raw: int) -> int | None:
+    """Decode VCP 0x60 value; Windows often returns packed (mh << 8) | ml."""
+    if raw < 0:
+        return None
+    if raw <= 0xFF:
+        return raw
+    high = (raw >> 8) & 0xFF
+    low = raw & 0xFF
+    if low in INPUT_SOURCE_NAMES:
+        return low
+    if high in INPUT_SOURCE_NAMES:
+        return high
+    if low:
+        return low
+    if high:
+        return high
+    return None
+
+
 def _format_input(value: int | None) -> str:
     if value is None:
         return "unknown"
-    if value > 0xFF:
-        return f"unavailable (enable DDC/CI in monitor OSD)"
     name = INPUT_SOURCE_NAMES.get(value)
     if name:
         return f"{name} (0x{value:02X})"
     return f"0x{value:02X}"
 
 
-def input_name(value: int) -> str:
-    if value < 0:
+def input_name(value: int | None) -> str:
+    if value is None or value < 0:
         return "unknown"
     return INPUT_SOURCE_NAMES.get(value, f"0x{value:02X}")
 
@@ -94,10 +111,7 @@ def get_input_source(handle: int) -> int | None:
     )
     if not ok:
         return None
-    value = int(current.value)
-    if value > 0xFF:
-        return None
-    return value
+    return _decode_vcp_input(int(current.value))
 
 
 def set_input_source(handle: int, value: int, state_key: str | None = None) -> None:
@@ -262,9 +276,6 @@ def _position_name(index: int, total: int) -> str:
 
 def _is_controllable(description: str, handle: int | None) -> bool:
     if not handle:
-        return False
-    lowered = description.lower()
-    if "generic pnp monitor" in lowered:
         return False
     return True
 

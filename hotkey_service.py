@@ -136,19 +136,25 @@ def build_registered_hotkeys(
         if not hotkey:
             continue
 
-        monitor = resolve_monitor(monitors, binding)
-        if monitor is None:
+        if resolve_monitor(monitors, binding) is None:
             continue
 
         input_a = parse_input_value(binding["input_a"])
         input_b = parse_input_value(binding["input_b"])
 
         def make_monitor_action(
-            selected_monitor: MonitorInfo = monitor,
+            monitor_binding: dict = binding,
             a: int = input_a,
             b: int = input_b,
         ) -> Callable[[], list[str]]:
             def action() -> list[str]:
+                live_monitors = enumerate_monitors()
+                selected_monitor = resolve_monitor(live_monitors, monitor_binding)
+                if selected_monitor is None:
+                    label = monitor_binding.get("monitor") or monitor_binding.get(
+                        "device", "?"
+                    )
+                    return [f"[{label}] monitor not found"]
                 if selected_monitor.handle is None:
                     return [f"[{selected_monitor.position}] not controllable"]
                 previous, new = toggle_input(
@@ -171,7 +177,7 @@ def build_registered_hotkeys(
                 action=HotkeyAction(
                     kind="monitor",
                     label=(
-                        f"[{monitor.position}] "
+                        f"[{binding.get('monitor', '?')}] "
                         f"{input_name(input_a)} <-> {input_name(input_b)}"
                     ),
                     callback=make_monitor_action(),
@@ -191,12 +197,17 @@ def build_registered_hotkeys(
             pc_b = pc_switch.get("pc_b_name", "PC 2")
             hotkey = pc_switch["hotkey"]
 
-            def pc_action() -> list[str]:
+            def pc_action(
+                monitor_entries: list[dict] = enabled_monitors,
+                name_a: str = pc_a,
+                name_b: str = pc_b,
+            ) -> list[str]:
+                live_monitors = enumerate_monitors()
                 target_name, lines = toggle_pc_group(
-                    monitors,
-                    enabled_monitors,
-                    pc_a,
-                    pc_b,
+                    live_monitors,
+                    monitor_entries,
+                    name_a,
+                    name_b,
                 )
                 return [f"Switched to {target_name}"] + lines
 
@@ -269,8 +280,8 @@ class HotkeyService:
 
     def _run_loop(self, config: dict) -> None:
         try:
-            monitors = enumerate_monitors(controllable_only=True)
-            if not monitors:
+            monitors = enumerate_monitors()
+            if not any(monitor.controllable for monitor in monitors):
                 self._error_queue.put("No DDC/CI monitors detected.")
                 self._ready_event.set()
                 return
