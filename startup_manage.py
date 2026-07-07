@@ -6,13 +6,15 @@ import sys
 import winreg
 from pathlib import Path
 
-from runtime_paths import app_dir, pythonw_path
+from runtime_paths import app_dir, executable_path, is_frozen, pythonw_path, settings_command
 
 APP_NAME = "MonitorInputSwitcher"
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 def launch_command() -> str:
+    if is_frozen():
+        return f'"{executable_path()}"'
     tray = app_dir() / "tray_app.py"
     return f'"{pythonw_path()}" "{tray}"'
 

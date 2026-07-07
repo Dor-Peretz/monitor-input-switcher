@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import ctypes
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -16,11 +15,13 @@ from PIL import Image, ImageDraw
 from config_store import config_path, load_config
 from hotkey_service import HotkeyService
 from startup_manage import disable_startup, enable_startup, is_startup_enabled
+from version import __app_name__, __github_url__, __version__
 
-from runtime_paths import app_dir
-UI_SCRIPT = app_dir() / "ui.py"
-LOG_FILE = app_dir() / "tray.log"
-ICON_FILE = app_dir() / "tray_icon.ico"
+from runtime_paths import app_dir, is_frozen, settings_command, user_data_dir
+
+LOG_FILE = (user_data_dir() if is_frozen() else app_dir()) / "tray.log"
+ICON_FILE = (user_data_dir() if is_frozen() else app_dir()) / "tray_icon.ico"
+TRAY_TITLE = f"{__app_name__} v{__version__}"
 MUTEX_NAME = "MonitorInputSwitcherTray"
 _mutex_handle = None
 
@@ -91,12 +92,16 @@ class TrayApplication:
                 self.toggle_startup,
                 checked=lambda _item: self._startup_enabled,
             ),
+            pystray.MenuItem(
+                f"About v{__version__}",
+                self.show_about,
+            ),
             pystray.MenuItem("Exit", self.exit_app),
         )
         self.icon = pystray.Icon(
             "monitor_input_switcher",
             load_tray_image(),
-            "Monitor Input Switcher",
+            TRAY_TITLE,
             menu,
             on_activate=self.open_settings,
         )
@@ -122,9 +127,12 @@ class TrayApplication:
 
     def open_settings(self, _icon=None, _item=None) -> None:
         subprocess.Popen(
-            [sys.executable, str(UI_SCRIPT), "--settings-only"],
+            settings_command(),
             cwd=str(app_dir()),
         )
+
+    def show_about(self, _icon=None, _item=None) -> None:
+        self._notify(f"v{__version__} — {__github_url__}")
 
     def toggle_startup(self, _icon=None, _item=None) -> None:
         if self._startup_enabled:
@@ -160,7 +168,7 @@ class TrayApplication:
     def _notify(self, message: str) -> None:
         if self.icon:
             try:
-                self.icon.notify(message, "Monitor Input Switcher")
+                self.icon.notify(message, TRAY_TITLE)
             except Exception:
                 pass
 

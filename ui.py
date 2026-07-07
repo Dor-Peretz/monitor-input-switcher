@@ -14,6 +14,7 @@ from config_store import (
     save_config,
 )
 from ddc_monitor import MonitorInfo, enumerate_monitors, read_active_pc
+from version import __app_name__, __version__
 from hardware_info import (
     DELL_DISPLAY_MANAGER_URL,
     controllable_reason,
@@ -92,7 +93,7 @@ class MonitorSwitcherUI:
     def __init__(self, root: tk.Tk, settings_only: bool = False) -> None:
         self.root = root
         self.settings_only = settings_only
-        self.root.title("Monitor Input Switcher")
+        self.root.title(f"{__app_name__} v{__version__}")
         self.root.geometry("920x680")
         self.root.minsize(760, 560)
 

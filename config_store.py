@@ -6,6 +6,8 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
+from runtime_paths import is_frozen, user_data_dir
+
 CONFIG_VERSION = 2
 
 DEFAULT_CONFIG: dict = {
@@ -32,6 +34,8 @@ INPUT_CHOICES: list[tuple[str, int]] = [
 
 
 def config_path() -> Path:
+    if is_frozen():
+        return user_data_dir() / "config.json"
     return Path(__file__).with_name("config.json")
 
 

@@ -1,5 +1,10 @@
 .switcher_state.json
+switcher_state.json
 tray.log
+tray_icon.ico
 __pycache__/
 *.pyc
 *.pyo
+build/
+dist/
+*.spec.bak

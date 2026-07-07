@@ -1,0 +1,25 @@
+# Created with YamlCreate.ps1 for winget submission.
+# Update InstallerUrl and InstallerSha256 for each release.
+
+PackageIdentifier: DorPeretz.MonitorInputSwitcher
+PackageVersion: 1.0.0
+PackageLocale: en-US
+Publisher: Dor Peretz
+PackageName: Monitor Input Switcher
+License: MIT
+ShortDescription: Switch monitor inputs on Windows using DDC/CI hotkeys
+Moniker: monitor-input-switcher
+Tags:
+  - monitor
+  - display
+  - ddc
+  - hotkey
+Installers:
+  - Architecture: x64
+    InstallerType: portable
+    InstallerUrl: https://github.com/Dor-Peretz/monitor-input-switcher/releases/download/v1.0.0/MonitorInputSwitcher.exe
+    InstallerSha256: REPLACE_WITH_SHA256
+    Commands:
+      - MonitorInputSwitcher
+ManifestType: singleton
+ManifestVersion: 1.6.0

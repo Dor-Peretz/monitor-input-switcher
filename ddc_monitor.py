@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
+from pathlib import Path
 
 user32 = ctypes.windll.user32
 dxva2 = ctypes.windll.dxva2
@@ -143,8 +144,10 @@ def switch_monitors_to_inputs(
 
 
 def _state_path():
-    from pathlib import Path
+    from runtime_paths import is_frozen, user_data_dir
 
+    if is_frozen():
+        return user_data_dir() / "switcher_state.json"
     return Path(__file__).with_name(".switcher_state.json")
 
 
