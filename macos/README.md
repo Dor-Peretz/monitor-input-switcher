@@ -70,6 +70,33 @@ python3 monitor_switcher.py toggle --monitor right    # toggle one monitor
 python3 monitor_switcher.py run                       # hotkeys in terminal
 ```
 
+## Stream Deck
+
+`streamdeck/` holds an Elgato Stream Deck plugin with two actions:
+
+| Action | What a press does |
+|--------|-------------------|
+| **PC Switch** | Moves every monitor in the PC-switch group to the other PC |
+| **Toggle Monitor Input** | Toggles one monitor between its two configured inputs |
+
+Keys read the same `config.json` and switching state as the hotkeys and the
+menu bar app, so all three stay in agreement — the key title shows the input
+(or PC) that is currently active, even when you switched with a hotkey.
+
+```bash
+./streamdeck/install.sh
+```
+
+The script symlinks the plugin into Stream Deck's plugin folder and restarts
+the app. Then drag an action onto a key; **Toggle Monitor Input** has a
+dropdown to pick which of your configured monitors it controls.
+
+Stream Deck runs the plugin as a plain Python process (`launch.sh` finds a
+`python3` the same way `ddc_monitor.py` finds `m1ddc`). It needs no extra
+packages, and opens no network port — presses call the DDC helpers in-process.
+
+Errors go to `streamdeck.log` in this folder.
+
 ## Configuration
 
 Settings are stored in `config.json` and edited through the UI.
@@ -126,6 +153,7 @@ python3 startup_manage.py status
 | `config_store.py` | Config load/save |
 | `startup_manage.py` | LaunchAgent (login item) management |
 | `monitor_switcher.py` | CLI entry point |
+| `streamdeck/` | Elgato Stream Deck plugin |
 
 ## Important differences from the Windows build
 

@@ -472,6 +472,11 @@ def _write_last_input(state_key: str, value: int) -> None:
     _save_state(data)
 
 
+def read_last_input(state_key: str) -> int | None:
+    """Last input value written for a monitor, or None if never switched."""
+    return _read_last_input(state_key)
+
+
 def read_active_pc(group_id: str = "default") -> str:
     data = _load_state()
     pc_groups = data.get("pc_groups", {})

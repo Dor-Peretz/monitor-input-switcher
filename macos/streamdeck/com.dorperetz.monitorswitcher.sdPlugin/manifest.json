@@ -1,0 +1,70 @@
+{
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "UUID": "com.dorperetz.monitorswitcher",
+  "Name": "Monitor Input Switcher",
+  "Version": "1.0.0",
+  "Author": "Dor Peretz",
+  "Description": "Switch monitor inputs over DDC/CI from a Stream Deck key",
+  "Icon": "imgs/plugin",
+  "Category": "Monitor Input Switcher",
+  "CategoryIcon": "imgs/plugin",
+  "URL": "https://github.com/Dor-Peretz/monitor-input-switcher",
+  "CodePath": "launch.sh",
+  "SDKVersion": 2,
+  "Software": {
+    "MinimumVersion": "6.5"
+  },
+  "OS": [
+    {
+      "Platform": "mac",
+      "MinimumVersion": "12.0"
+    }
+  ],
+  "Actions": [
+    {
+      "Icon": "imgs/action-pc",
+      "Name": "PC Switch",
+      "UUID": "com.dorperetz.monitorswitcher.pcswitch",
+      "Tooltip": "Move every configured monitor to the other PC",
+      "SupportedInMultiActions": true,
+      "Controllers": ["Keypad"],
+      "States": [
+        {
+          "Image": "imgs/pc-a",
+          "TitleAlignment": "bottom",
+          "FontSize": "11",
+          "TitleColor": "#ffffff"
+        },
+        {
+          "Image": "imgs/pc-b",
+          "TitleAlignment": "bottom",
+          "FontSize": "11",
+          "TitleColor": "#ffffff"
+        }
+      ]
+    },
+    {
+      "Icon": "imgs/action-input",
+      "Name": "Toggle Monitor Input",
+      "UUID": "com.dorperetz.monitorswitcher.input",
+      "Tooltip": "Toggle one monitor between its two configured inputs",
+      "PropertyInspectorPath": "propertyinspector/input.html",
+      "SupportedInMultiActions": true,
+      "Controllers": ["Keypad"],
+      "States": [
+        {
+          "Image": "imgs/input-a",
+          "TitleAlignment": "bottom",
+          "FontSize": "11",
+          "TitleColor": "#ffffff"
+        },
+        {
+          "Image": "imgs/input-b",
+          "TitleAlignment": "bottom",
+          "FontSize": "11",
+          "TitleColor": "#ffffff"
+        }
+      ]
+    }
+  ]
+}

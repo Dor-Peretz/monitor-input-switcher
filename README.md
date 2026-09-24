@@ -2,6 +2,8 @@
 
 Switch monitor inputs on Windows using DDC/CI. Configure per-monitor hotkeys, toggle between two inputs (DisplayPort, USB-C, HDMI, etc.), or switch a whole desk between two PCs with one shortcut.
 
+> macOS build lives in [`macos/`](macos/README.md), and ships an [Elgato Stream Deck plugin](macos/README.md#stream-deck) for switching from a key.
+
 ## Download (recommended)
 
 1. Open **[Releases](https://github.com/Dor-Peretz/monitor-input-switcher/releases)** and download `MonitorInputSwitcher.exe` (or the `.zip`).
