@@ -8,6 +8,7 @@ this Stream Deck to the other computer and leaves the monitors alone.
 from __future__ import annotations
 
 import argparse
+import base64
 import queue
 import sys
 import threading
@@ -120,7 +121,10 @@ def toggle_bindings(config: dict) -> list[dict]:
 
 
 def find_binding(config: dict, target: str) -> dict | None:
-    bindings = toggle_bindings(config)
+    return lookup_binding(toggle_bindings(config), target)
+
+
+def lookup_binding(bindings: list[dict], target: str) -> dict | None:
     target = (target or "").strip().lower()
     if not target:
         return bindings[0] if bindings else None
@@ -131,6 +135,79 @@ def find_binding(config: dict, target: str) -> dict | None:
         if (binding.get("monitor") or "").strip().lower() == target:
             return binding
     return None
+
+
+# Mac is always the blue key. The other computer is always the green key.
+# State 0 is Mac, state 1 is the PC. Both states are painted with that same
+# image so a press cannot flip the color.
+_POSITION_RANK = {"only": 0, "left": 0, "center": 1, "right": 2}
+_IMAGE_URIS: dict[str, str] = {}
+
+
+def image_uri(name: str) -> str:
+    cached = _IMAGE_URIS.get(name)
+    if cached is not None:
+        return cached
+    raw = (PLUGIN_DIR / "imgs" / f"{name}.png").read_bytes()
+    uri = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    _IMAGE_URIS[name] = uri
+    return uri
+
+
+def image_for(action: str, state: int) -> str:
+    mac = state == 0
+    if action == ACTION_DECK:
+        return "deck-mac" if mac else "deck-pc"
+    if action == ACTION_PC_SWITCH:
+        return "pc-a" if mac else "pc-b"
+    return "input-a" if mac else "input-b"
+
+
+def spatial_bindings(bindings: list[dict]) -> list[dict]:
+    """Left-to-right desk order, using the positions saved in config."""
+
+    def sort_key(binding: dict) -> tuple:
+        position = (binding.get("monitor") or "").strip().lower()
+        return (_POSITION_RANK.get(position, 9), binding_id(binding).lower())
+
+    return sorted(bindings, key=sort_key)
+
+
+def reconcile_monitor_targets(
+    keys: list[dict],
+    bindings: list[dict],
+) -> list[tuple[dict, str]]:
+    """Point mirrored monitor keys at the screen on the same side.
+
+    ``keys`` items have ``column``, ``row``, and ``target``. Left-to-right on
+    the Stream Deck follows left-to-right on the desk. A pairing that already
+    matches is left alone. A mirrored pairing, or several keys aimed at one
+    monitor, is rewritten.
+    """
+    placed = [
+        key
+        for key in keys
+        if key.get("column") is not None and key.get("row") is not None
+    ]
+    ordered = spatial_bindings(bindings)
+    if len(placed) < 2 or len(ordered) < 2:
+        return []
+
+    placed.sort(key=lambda key: (key["column"], key["row"], key.get("target") or ""))
+    count = min(len(placed), len(ordered))
+    placed = placed[:count]
+    ordered = ordered[:count]
+    desired = [binding_id(binding) for binding in ordered]
+    current = []
+    for key in placed:
+        found = lookup_binding(bindings, key.get("target") or "")
+        current.append(binding_id(found) if found else "")
+
+    mirrored = current == list(reversed(desired))
+    collapsed = any(not item for item in current) or len(set(current)) < len(current)
+    if current == desired or not (mirrored or collapsed):
+        return []
+    return [(key, target) for key, target in zip(placed, desired) if key.get("target") != target]
 
 
 class Plugin:
@@ -158,25 +235,24 @@ class Plugin:
         context = message.get("context")
         action = message.get("action")
         payload = message.get("payload") or {}
+        if event == "keyDown":
+            if context:
+                self._remember_key(context, action, payload)
+                self.jobs.put((context, payload.get("settings") or {}))
+            return
+
         if event in ("willAppear", "didReceiveSettings"):
             if not context:
                 return
-            self.contexts[context] = {
-                "action": action or self.contexts.get(context, {}).get("action"),
-                "settings": payload.get("settings") or {},
-            }
+            self._remember_key(context, action, payload)
             self.signatures.pop(context, None)
+            self._reconcile_monitor_keys()
             self.refresh_context(context)
             return
 
         if event == "willDisappear":
             self.contexts.pop(context, None)
             self.signatures.pop(context, None)
-            return
-
-        if event == "keyDown":
-            if context:
-                self.jobs.put((context, payload.get("settings") or {}))
             return
 
         if event == "sendToPlugin":
@@ -227,7 +303,8 @@ class Plugin:
             monitor = resolve_monitor(self.monitors.get(), binding)
             state_key = monitor.device_name if monitor else ""
 
-        label = binding.get("device") or binding.get("monitor") or "monitor"
+        position = (binding.get("monitor") or "").strip()
+        label = position.capitalize() if position else (binding.get("device") or "monitor")
         last = read_last_input(state_key) if state_key else None
         if last is None:
             return 0, f"{label}\n\u2014"
@@ -236,6 +313,7 @@ class Plugin:
             input_b = parse_input_value(binding.get("input_b"))
         except (TypeError, ValueError):
             input_b = None
+        # input A belongs to the Mac (blue). input B belongs to the PC (green).
         state = 1 if input_b is not None and last == input_b else 0
         return state, f"{label}\n{input_name(last)}"
 
@@ -254,11 +332,13 @@ class Plugin:
             state, title = 0, "Error"
             log(f"Refresh failed: {exc}")
 
-        signature = f"{state}|{title}"
+        action = entry.get("action") or ACTION_INPUT
+        image = image_for(action, state)
+        signature = f"{state}|{title}|{image}"
         if self.signatures.get(context) == signature:
             return
         self.signatures[context] = signature
-        self._send_key_face(context, state, title)
+        self._send_key_face(context, state, title, action)
 
     def refresh_all(self) -> None:
         for context in list(self.contexts):
@@ -298,15 +378,66 @@ class Plugin:
                 self.signatures.pop(context, None)
                 self.refresh_all()
 
-    def _send_key_face(self, context: str, state: int, title: str) -> None:
-        """Update the physical key and the Stream Deck app window together."""
-        self.client.send("setState", context=context, payload={"state": state})
-        for target in (0, 2):
-            self.client.send(
-                "setTitle",
-                context=context,
-                payload={"title": title, "state": state, "target": target},
+    def _remember_key(self, context: str | None, action: str | None, payload: dict) -> None:
+        if not context:
+            return
+        previous = self.contexts.get(context, {})
+        coords = payload.get("coordinates") or {}
+        settings = payload.get("settings")
+        if not isinstance(settings, dict):
+            settings = previous.get("settings") or {}
+        self.contexts[context] = {
+            "action": action or previous.get("action"),
+            "settings": settings,
+            "column": coords.get("column", previous.get("column")),
+            "row": coords.get("row", previous.get("row")),
+        }
+
+    def _reconcile_monitor_keys(self) -> None:
+        """If the two monitor keys are swapped, aim each one at its own screen."""
+        config = load_config()
+        bindings = toggle_bindings(config)
+        keys = []
+        for context, entry in self.contexts.items():
+            if entry.get("action") != ACTION_INPUT:
+                continue
+            settings = entry.get("settings") or {}
+            keys.append(
+                {
+                    "context": context,
+                    "column": entry.get("column"),
+                    "row": entry.get("row"),
+                    "target": settings.get("target") or "",
+                }
             )
+        for key, target in reconcile_monitor_targets(keys, bindings):
+            context = key["context"]
+            entry = self.contexts.get(context)
+            if not entry:
+                continue
+            settings = dict(entry.get("settings") or {})
+            settings["target"] = target
+            entry["settings"] = settings
+            self.signatures.pop(context, None)
+            self.client.send("setSettings", context=context, payload=settings)
+            log(f"Monitor key -> {target}")
+
+    def _send_key_face(self, context: str, state: int, title: str, action: str) -> None:
+        """Paint Mac blue and PC green on both states, so a press cannot flip it."""
+        uri = image_uri(image_for(action, state))
+        for face in (0, 1):
+            for target in (0, 2):
+                self.client.send(
+                    "setImage",
+                    context=context,
+                    payload={"image": uri, "target": target, "state": face},
+                )
+                self.client.send(
+                    "setTitle",
+                    context=context,
+                    payload={"title": title, "target": target, "state": face},
+                )
+        self.client.send("setState", context=context, payload={"state": state})
 
     def _show_deck(self, owner: str) -> None:
         from streamdeck_hub import owner_name, write_selected
@@ -314,11 +445,12 @@ class Plugin:
         write_selected(owner)
         state = 0 if owner == "a" else 1
         title = owner_name(owner)
+        image = image_for(ACTION_DECK, state)
         for context, entry in list(self.contexts.items()):
             if entry.get("action") != ACTION_DECK:
                 continue
-            self.signatures[context] = f"{state}|{title}"
-            self._send_key_face(context, state, title)
+            self.signatures[context] = f"{state}|{title}|{image}"
+            self._send_key_face(context, state, title, ACTION_DECK)
 
     def _do_deck_switch(self) -> None:
         from streamdeck_hub import displayed_owner, toggle_deck_owner
