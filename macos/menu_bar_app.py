@@ -53,6 +53,9 @@ class MenuBarApp(rumps.App):
         ]
         self._refresh_startup_state()
         self._start_hotkeys()
+        from streamdeck_hub import ensure_hub_listener
+
+        ensure_hub_listener()
 
     # -- lifecycle -------------------------------------------------------- #
 

@@ -29,6 +29,9 @@ ICONS = {
     "pc-b": (GREEN, "desk", False),
     "input-a": (BLUE, "swap", False),
     "input-b": (GREEN, "swap", False),
+    "action-deck": (SLATE, "swap", True),
+    "deck-mac": (BLUE, "swap", False),
+    "deck-pc": (GREEN, "swap", False),
 }
 
 

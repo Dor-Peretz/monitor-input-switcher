@@ -7,5 +7,15 @@
     "pc_a_name": "PC 1",
     "pc_b_name": "PC 2",
     "monitors": []
+  },
+  "streamdeck_hub": {
+    "enabled": false,
+    "local_pc": "b",
+    "listen_host": "0.0.0.0",
+    "listen_port": 8765,
+    "peer_url": "",
+    "token": "",
+    "client_path": "",
+    "device_match": "Stream Deck"
   }
 }

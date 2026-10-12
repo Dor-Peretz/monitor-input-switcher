@@ -124,6 +124,32 @@ GitHub Actions builds the `.exe`, zips it, and attaches both to a GitHub Release
 | `config_store.py` | Config load/save |
 | `monitor_switcher.py` | CLI entry point |
 | `monitor_input_switcher.spec` | PyInstaller build spec |
+| `streamdeck_hub.py` | Mac / PC key that hands the Stream Deck to the other computer |
+
+## Mac / PC Stream Deck key
+
+Windows setup is a checklist in
+[docs/windows-streamdeck-handoff.md](docs/windows-streamdeck-handoff.md).
+Start there on the PC.
+
+The deck stays plugged into an always-on VirtualHere server (this desk:
+**proxmox2**, `192.168.68.70`, TCP `7575`). The **Mac / PC** key hands the
+deck to the other computer. Monitor switching does not move it. This PC is
+`local_pc: "b"`.
+
+```json
+"streamdeck_hub": {
+  "enabled": true,
+  "local_pc": "b",
+  "listen_port": 8765,
+  "peer_url": "http://MAC-LAN-IP:8765",
+  "device_match": "Stream Deck"
+}
+```
+
+The Mac side is `local_pc: "a"` and points `peer_url` back here. Drag
+**Mac / PC** onto a key. Install steps are in
+[`macos/README.md`](macos/README.md#mac--pc-key).
 
 ## Notes
 

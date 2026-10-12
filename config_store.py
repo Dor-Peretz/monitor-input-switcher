@@ -10,6 +10,17 @@ from runtime_paths import is_frozen, user_data_dir
 
 CONFIG_VERSION = 2
 
+DEFAULT_STREAMDECK_HUB: dict = {
+    "enabled": False,
+    "local_pc": "b",
+    "listen_host": "0.0.0.0",
+    "listen_port": 8765,
+    "peer_url": "",
+    "token": "",
+    "client_path": "",
+    "device_match": "Stream Deck",
+}
+
 DEFAULT_CONFIG: dict = {
     "version": CONFIG_VERSION,
     "monitor_bindings": [],
@@ -20,6 +31,7 @@ DEFAULT_CONFIG: dict = {
         "pc_b_name": "PC 2",
         "monitors": [],
     },
+    "streamdeck_hub": deepcopy(DEFAULT_STREAMDECK_HUB),
 }
 
 INPUT_CHOICES: list[tuple[str, int]] = [
@@ -81,6 +93,7 @@ def migrate_config(data: dict) -> dict:
             "version": CONFIG_VERSION,
             "monitor_bindings": monitor_bindings,
             "pc_switch": deepcopy(DEFAULT_CONFIG["pc_switch"]),
+            "streamdeck_hub": deepcopy(DEFAULT_STREAMDECK_HUB),
         }
 
     return _ensure_pc_switch(deepcopy(DEFAULT_CONFIG) | data)
@@ -91,6 +104,11 @@ def _ensure_pc_switch(data: dict) -> dict:
         data["pc_switch"] = deepcopy(DEFAULT_CONFIG["pc_switch"])
     if "monitor_bindings" not in data:
         data["monitor_bindings"] = []
+    hub = data.get("streamdeck_hub")
+    merged = deepcopy(DEFAULT_STREAMDECK_HUB)
+    if isinstance(hub, dict):
+        merged.update(hub)
+    data["streamdeck_hub"] = merged
     return data
 
 

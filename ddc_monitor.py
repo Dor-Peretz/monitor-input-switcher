@@ -166,6 +166,20 @@ def _format_input(value: int | None) -> str:
     return f"0x{value:02X}"
 
 
+class DDCError(RuntimeError):
+    """Raised when a DDC/CI call fails. Matches the macOS module."""
+
+
+def parse_input_value(value: int | str) -> int:
+    """Parse a DDC input code that may be an int, decimal string, or 0x hex."""
+    if isinstance(value, int):
+        return value
+    text = str(value).strip().lower()
+    if text.startswith("0x"):
+        return int(text, 16)
+    return int(text)
+
+
 def input_name(value: int | None) -> str:
     if value is None or value < 0:
         return "unknown"

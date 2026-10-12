@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Stream Deck plugin process for Monitor Input Switcher (macOS).
+"""Stream Deck plugin for Monitor Input Switcher.
 
-Stream Deck starts this script and passes the port of its local WebSocket
-server. Key presses call straight into the same DDC helpers the menu bar app
-and hotkeys use, and switching state is read from the shared state file, so a
-key, a hotkey and the menu bar item all stay in agreement.
+PC Switch only changes monitor inputs. Mac / PC is a separate key: it hands
+this Stream Deck to the other computer and leaves the monitors alone.
 """
 
 from __future__ import annotations
@@ -18,7 +16,9 @@ import traceback
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent
-APP_DIR = PLUGIN_DIR.parents[1]
+# Mac helpers live in macos/. Windows helpers live in the repo root, two
+# levels above macos/streamdeck/<this plugin>.
+APP_DIR = PLUGIN_DIR.parents[2] if sys.platform == "win32" else PLUGIN_DIR.parents[1]
 sys.path.insert(0, str(APP_DIR))
 
 from config_store import load_config  # noqa: E402
@@ -37,6 +37,7 @@ from sdclient import StreamDeckClient  # noqa: E402
 
 ACTION_PC_SWITCH = "com.dorperetz.monitorswitcher.pcswitch"
 ACTION_INPUT = "com.dorperetz.monitorswitcher.input"
+ACTION_DECK = "com.dorperetz.monitorswitcher.deck"
 
 LOG_FILE = APP_DIR / "streamdeck.log"
 REFRESH_SECONDS = 1.5
@@ -90,8 +91,36 @@ def binding_id(binding: dict) -> str:
     return (binding.get("device") or binding.get("monitor") or "").strip()
 
 
+def toggle_bindings(config: dict) -> list[dict]:
+    """Monitors a Toggle key can flip.
+
+    Per-monitor hotkey rows come first. A display that only lives on the PC
+    Switch tab (the second settings screen) is included too, so it can have
+    its own toggle key without a separate hotkey.
+    """
+    seen: set[str] = set()
+    bindings: list[dict] = []
+
+    def add(binding: dict) -> None:
+        ident = binding_id(binding).lower()
+        if not ident or ident in seen:
+            return
+        seen.add(ident)
+        bindings.append(binding)
+
+    for binding in config.get("monitor_bindings", []):
+        if binding.get("enabled", True):
+            add(binding)
+
+    for binding in config.get("pc_switch", {}).get("monitors", []):
+        if binding.get("enabled", True):
+            add(binding)
+
+    return bindings
+
+
 def find_binding(config: dict, target: str) -> dict | None:
-    bindings = config.get("monitor_bindings", [])
+    bindings = toggle_bindings(config)
     target = (target or "").strip().lower()
     if not target:
         return bindings[0] if bindings else None
@@ -160,8 +189,7 @@ class Plugin:
         config = load_config()
         targets = [
             {"id": binding_id(binding), "label": binding_label(binding)}
-            for binding in config.get("monitor_bindings", [])
-            if binding_id(binding)
+            for binding in toggle_bindings(config)
         ]
         self.client.send(
             "sendToPropertyInspector",
@@ -170,6 +198,16 @@ class Plugin:
         )
 
     # -- key rendering ---------------------------------------------------- #
+
+    def _deck_view(self) -> tuple[int, str]:
+        from streamdeck_hub import current_owner, owner_name
+
+        try:
+            owner = current_owner()
+        except Exception as exc:
+            log(f"Deck status failed: {exc}")
+            return 0, "Deck"
+        return (0 if owner == "a" else 1), owner_name(owner)
 
     def _pc_switch_view(self) -> tuple[int, str]:
         config = load_config()
@@ -190,7 +228,7 @@ class Plugin:
             monitor = resolve_monitor(self.monitors.get(), binding)
             state_key = monitor.device_name if monitor else ""
 
-        label = binding.get("monitor") or binding.get("device") or "monitor"
+        label = binding.get("device") or binding.get("monitor") or "monitor"
         last = read_last_input(state_key) if state_key else None
         if last is None:
             return 0, f"{label}\n\u2014"
@@ -209,6 +247,8 @@ class Plugin:
         try:
             if entry["action"] == ACTION_PC_SWITCH:
                 state, title = self._pc_switch_view()
+            elif entry["action"] == ACTION_DECK:
+                state, title = self._deck_view()
             else:
                 state, title = self._input_view(entry["settings"])
         except (DDCError, OSError, ValueError) as exc:
@@ -247,6 +287,8 @@ class Plugin:
             try:
                 if entry["action"] == ACTION_PC_SWITCH:
                     self._do_pc_switch()
+                elif entry["action"] == ACTION_DECK:
+                    self._do_deck_switch()
                 else:
                     self._do_input_toggle(settings or entry["settings"])
                 self.client.send("showOk", context=context)
@@ -257,6 +299,12 @@ class Plugin:
                 self.monitors.invalidate()
                 self.signatures.pop(context, None)
                 self.refresh_all()
+
+    def _do_deck_switch(self) -> None:
+        from streamdeck_hub import toggle_deck_owner
+
+        note = toggle_deck_owner()
+        log(f"Deck switch -> {note}")
 
     def _do_pc_switch(self) -> None:
         config = load_config()
@@ -312,6 +360,9 @@ def main() -> int:
     try:
         client.connect()
         plugin.start_workers()
+        from streamdeck_hub import ensure_hub_listener
+
+        ensure_hub_listener()
         client.run(plugin.on_message)
     except Exception:
         log("Fatal error:\n" + traceback.format_exc())

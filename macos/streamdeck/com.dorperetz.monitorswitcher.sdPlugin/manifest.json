@@ -4,12 +4,13 @@
   "Name": "Monitor Input Switcher",
   "Version": "1.0.0",
   "Author": "Dor Peretz",
-  "Description": "Switch monitor inputs over DDC/CI from a Stream Deck key",
+  "Description": "Switch monitor inputs, or hand the Stream Deck between Mac and PC",
   "Icon": "imgs/plugin",
   "Category": "Monitor Input Switcher",
   "CategoryIcon": "imgs/plugin",
   "URL": "https://github.com/Dor-Peretz/monitor-input-switcher",
   "CodePath": "launch.sh",
+  "CodePathWin": "launch.bat",
   "SDKVersion": 2,
   "Software": {
     "MinimumVersion": "6.5"
@@ -18,6 +19,10 @@
     {
       "Platform": "mac",
       "MinimumVersion": "12.0"
+    },
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
     }
   ],
   "Actions": [
@@ -37,6 +42,28 @@
         },
         {
           "Image": "imgs/pc-b",
+          "TitleAlignment": "bottom",
+          "FontSize": "11",
+          "TitleColor": "#ffffff"
+        }
+      ]
+    },
+    {
+      "Icon": "imgs/action-deck",
+      "Name": "Mac / PC",
+      "UUID": "com.dorperetz.monitorswitcher.deck",
+      "Tooltip": "Hand this Stream Deck to the Mac or the PC. Does not change monitors.",
+      "SupportedInMultiActions": true,
+      "Controllers": ["Keypad"],
+      "States": [
+        {
+          "Image": "imgs/deck-mac",
+          "TitleAlignment": "bottom",
+          "FontSize": "11",
+          "TitleColor": "#ffffff"
+        },
+        {
+          "Image": "imgs/deck-pc",
           "TitleAlignment": "bottom",
           "FontSize": "11",
           "TitleColor": "#ffffff"

@@ -77,6 +77,7 @@ python3 monitor_switcher.py run                       # hotkeys in terminal
 | Action | What a press does |
 |--------|-------------------|
 | **PC Switch** | Moves every monitor in the PC-switch group to the other PC |
+| **Mac / PC** | Hands this Stream Deck to the other computer. Does not change monitors |
 | **Toggle Monitor Input** | Toggles one monitor between its two configured inputs |
 
 Keys read the same `config.json` and switching state as the hotkeys and the
@@ -89,13 +90,77 @@ menu bar app, so all three stay in agreement — the key title shows the input
 
 The script symlinks the plugin into Stream Deck's plugin folder and restarts
 the app. Then drag an action onto a key; **Toggle Monitor Input** has a
-dropdown to pick which of your configured monitors it controls.
+dropdown to pick which monitor it controls. The list includes per-monitor
+hotkey rows and every monitor included on the PC Switch tab, so a second
+display that has no hotkey of its own can still have a toggle key.
 
 Stream Deck runs the plugin as a plain Python process (`launch.sh` finds a
 `python3` the same way `ddc_monitor.py` finds `m1ddc`). It needs no extra
 packages, and opens no network port — presses call the DDC helpers in-process.
 
 Errors go to `streamdeck.log` in this folder.
+
+### Mac / PC key
+
+Windows setup, in order, is
+[docs/windows-streamdeck-handoff.md](../docs/windows-streamdeck-handoff.md).
+
+This key is separate from monitor switching. **PC Switch** and the hotkeys
+only change monitor inputs. **Mac / PC** hands the Stream Deck itself to the
+other computer, so the Elgato app there (Zoom included) takes over.
+
+The deck stays plugged into the always-on VirtualHere server on **proxmox2**
+(`192.168.68.70`, TCP `7575`, Elgato `0fd9:0080` only). This Mac is
+`local_pc: "a"` (label **Mac**). The Windows PC is `local_pc: "b"` (label
+**PC**). Each side listens on port `8765`.
+
+In `config.json`:
+
+```json
+"streamdeck_hub": {
+  "enabled": true,
+  "local_pc": "a",
+  "listen_port": 8765,
+  "peer_url": "http://WINDOWS-LAN-IP:8765",
+  "token": "",
+  "client_path": "/Applications/VirtualHereUniversal.app/Contents/MacOS/VirtualHereUniversal",
+  "device_match": "Stream Deck"
+}
+```
+
+On Windows set `local_pc` to `"b"` and `peer_url` to this Mac’s `http://…:8765`.
+Use the same `token` on both sides when you set one. Leave VirtualHere running
+on both computers. The Windows client is `vhui64.exe`.
+
+Drag **Mac / PC** onto a key on both computers. Pressing it runs this plugin
+(`launch.sh` on the Mac, `launch.bat` on Windows) and does not touch monitors.
+
+What the Windows machine still needs:
+
+1. VirtualHere client installed and running (`vhui64.exe`). It should see
+   `proxmox2` and the Stream Deck. Do not turn on Auto-Use; this app claims
+   and releases the deck itself.
+2. This repo on the PC. Symlink the plugin folder into Stream Deck (do not
+   copy it — `plugin.py` walks up to the repo root for the Windows DDC code):
+
+```powershell
+New-Item -ItemType SymbolicLink `
+  -Path "$env:APPDATA\Elgato\StreamDeck\Plugins\com.dorperetz.monitorswitcher.sdPlugin" `
+  -Target "C:\path\to\monitor-input-switcher\macos\streamdeck\com.dorperetz.monitorswitcher.sdPlugin"
+```
+
+3. In the Windows `config.json`, enable the hub. `local_pc` is `"b"`.
+   `peer_url` is this Mac on port `8765`. Put the PC’s LAN address into the
+   Mac’s `peer_url` the same way.
+4. Drag **Mac / PC** onto a key, then quit and reopen Stream Deck.
+
+Manual check from this folder:
+
+```bash
+python3 streamdeck_hub.py status
+python3 streamdeck_hub.py claim
+python3 streamdeck_hub.py release
+```
 
 ## Configuration
 
@@ -154,6 +219,7 @@ python3 startup_manage.py status
 | `startup_manage.py` | LaunchAgent (login item) management |
 | `monitor_switcher.py` | CLI entry point |
 | `streamdeck/` | Elgato Stream Deck plugin |
+| `streamdeck_hub.py` | Mac / PC key that hands the Stream Deck to the other computer |
 
 ## Important differences from the Windows build
 

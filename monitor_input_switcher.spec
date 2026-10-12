@@ -14,6 +14,7 @@ a = Analysis(
     hiddenimports=[
         "pystray._win32",
         "PIL._tkinter_finder",
+        "streamdeck_hub",
     ],
     hookspath=[],
     hooksconfig={},
