@@ -157,21 +157,18 @@ def controllable_reason(monitor: MonitorInfo, extra: dict) -> str:
             )
         return "Ready — DDC/CI input switching available."
 
-    if not monitor.handle:
-        if extra.get("uses_generic_driver") and extra.get("driver_url"):
-            model = extra.get("detected_model") or "this monitor"
-            return (
-                f"Windows is using a generic driver for {model}. "
-                "Install the Dell monitor driver and enable DDC/CI in the OSD."
-            )
-        if "generic pnp" in monitor.description.lower():
-            return (
-                "No DDC/CI handle — may be a laptop internal screen, "
-                "which cannot switch video inputs."
-            )
-        return "No DDC/CI handle from Windows. Enable DDC/CI in the monitor OSD."
-
-    return "DDC/CI handle present but input control is unavailable."
+    if extra.get("uses_generic_driver") and extra.get("driver_url"):
+        model = extra.get("detected_model") or "this monitor"
+        return (
+            f"Windows is using a generic driver for {model}. "
+            "Install the Dell monitor driver and enable DDC/CI in the OSD."
+        )
+    if "generic pnp" in monitor.description.lower():
+        return (
+            "No DDC/CI handle — may be a laptop internal screen, "
+            "which cannot switch video inputs."
+        )
+    return "No DDC/CI handle from Windows. Enable DDC/CI in the monitor OSD."
 
 
 def get_pnp_monitors() -> list[PnpMonitor]:

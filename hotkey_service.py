@@ -29,6 +29,7 @@ MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
 
 VK_NAMES: dict[str, int] = {
     **{chr(code).lower(): code for code in range(ord("A"), ord("Z") + 1)},
@@ -125,7 +126,7 @@ def parse_input_value(value: int | str) -> int:
 
 
 def build_registered_hotkeys(
-    config: dict, monitors: list[MonitorInfo]
+    config: dict, _monitors: list[MonitorInfo] | None = None
 ) -> list[RegisteredHotkey]:
     registered: list[RegisteredHotkey] = []
 
@@ -134,9 +135,6 @@ def build_registered_hotkeys(
             continue
         hotkey = binding.get("hotkey", "").strip()
         if not hotkey:
-            continue
-
-        if resolve_monitor(monitors, binding) is None:
             continue
 
         input_a = parse_input_value(binding["input_a"])
@@ -155,10 +153,10 @@ def build_registered_hotkeys(
                         "device", "?"
                     )
                     return [f"[{label}] monitor not found"]
-                if selected_monitor.handle is None:
+                if not selected_monitor.controllable:
                     return [f"[{selected_monitor.position}] not controllable"]
                 previous, new = toggle_input(
-                    selected_monitor.handle,
+                    selected_monitor,
                     a,
                     b,
                     selected_monitor.device_name,
@@ -281,11 +279,6 @@ class HotkeyService:
     def _run_loop(self, config: dict) -> None:
         try:
             monitors = enumerate_monitors()
-            if not any(monitor.controllable for monitor in monitors):
-                self._error_queue.put("No DDC/CI monitors detected.")
-                self._ready_event.set()
-                return
-
             hotkeys = build_registered_hotkeys(config, monitors)
             if not hotkeys:
                 self._error_queue.put("No enabled hotkey bindings found.")
@@ -295,7 +288,7 @@ class HotkeyService:
             registered: list[tuple[int, HotkeyAction, str]] = []
             for index, item in enumerate(hotkeys, start=1):
                 modifiers, vk = parse_hotkey(item.hotkey)
-                if not user32.RegisterHotKey(None, index, modifiers, vk):
+                if not user32.RegisterHotKey(None, index, modifiers | MOD_NOREPEAT, vk):
                     self._error_queue.put(
                         f"Could not register hotkey '{item.hotkey}'."
                     )
@@ -321,7 +314,7 @@ class HotkeyService:
                         try:
                             lines = action.callback()
                             self._event_queue.put(lines)
-                        except OSError as exc:
+                        except Exception as exc:
                             self._event_queue.put([f"Error: {exc}"])
                     user32.TranslateMessage(ctypes.byref(msg))
                     user32.DispatchMessageW(ctypes.byref(msg))
@@ -341,12 +334,12 @@ def run_toggle_cli(
     input_b: int,
 ) -> None:
     monitor = find_monitor(monitors, monitor_selector)
-    if not monitor.controllable or monitor.handle is None:
+    if not monitor.controllable:
         raise ValueError(
             f"Monitor [{monitor.position}] {monitor.description} is not DDC/CI controllable."
         )
     previous, new = toggle_input(
-        monitor.handle,
+        monitor,
         input_a,
         input_b,
         monitor.device_name,

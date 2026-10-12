@@ -163,6 +163,13 @@ class TrayApplication:
                 if mtime > self._config_mtime:
                     self._config_mtime = mtime
                     self.reload_hotkeys()
+            for event in self.service.poll_events():
+                summary = " | ".join(event)
+                log(summary)
+                self._notify(summary[:180])
+            for error in self.service.poll_errors():
+                log(f"Hotkey error: {error}")
+                self._notify(f"Hotkey error: {error}")
             time.sleep(1.5)
 
     def _notify(self, message: str) -> None:

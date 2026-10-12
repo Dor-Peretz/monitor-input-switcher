@@ -3,14 +3,47 @@
 from __future__ import annotations
 
 import ctypes
+import threading
+import time
+from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
-user32 = ctypes.windll.user32
-dxva2 = ctypes.windll.dxva2
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 VCP_INPUT_SELECT = 0x60
+_SET_DELAYS = (0.08, 0.16, 0.28, 0.45, 0.7)
+_MULTI_MONITOR_GAP = 0.22
+_DDC_MUTEX_NAME = "Local\\MonitorInputSwitcherDDC"
+_WAIT_MS = 8000
+_ddc_lock = threading.RLock()
+_ddc_mutex = kernel32.CreateMutexW(None, False, _DDC_MUTEX_NAME)
+
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.ReleaseMutex.restype = wintypes.BOOL
+kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+
+
+@contextmanager
+def _ddc_session():
+    """Serialize DDC/CI across threads and between tray + settings processes."""
+    with _ddc_lock:
+        wait_result = 0
+        if _ddc_mutex:
+            wait_result = kernel32.WaitForSingleObject(_ddc_mutex, _WAIT_MS)
+            if wait_result not in (0, 0x00000080):  # WAIT_OBJECT_0, WAIT_ABANDONED
+                raise OSError("Timed out waiting for another switch to finish")
+        try:
+            yield
+        finally:
+            if _ddc_mutex:
+                kernel32.ReleaseMutex(_ddc_mutex)
 
 INPUT_SOURCE_NAMES: dict[int, str] = {
     0x01: "VGA",
@@ -42,6 +75,40 @@ class MONITORINFOEXW(ctypes.Structure):
     ]
 
 
+dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
+dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [
+    wintypes.HMONITOR,
+    wintypes.LPDWORD,
+]
+dxva2.GetPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
+dxva2.GetPhysicalMonitorsFromHMONITOR.argtypes = [
+    wintypes.HMONITOR,
+    wintypes.DWORD,
+    ctypes.POINTER(PHYSICAL_MONITOR),
+]
+dxva2.DestroyPhysicalMonitors.restype = wintypes.BOOL
+dxva2.DestroyPhysicalMonitors.argtypes = [
+    wintypes.DWORD,
+    ctypes.POINTER(PHYSICAL_MONITOR),
+]
+dxva2.GetVCPFeatureAndVCPFeatureReply.restype = wintypes.BOOL
+dxva2.GetVCPFeatureAndVCPFeatureReply.argtypes = [
+    wintypes.HANDLE,
+    wintypes.BYTE,
+    ctypes.c_void_p,
+    wintypes.LPDWORD,
+    wintypes.LPDWORD,
+]
+dxva2.SetVCPFeature.restype = wintypes.BOOL
+dxva2.SetVCPFeature.argtypes = [
+    wintypes.HANDLE,
+    wintypes.BYTE,
+    wintypes.DWORD,
+]
+user32.GetMonitorInfoW.restype = wintypes.BOOL
+user32.EnumDisplayMonitors.restype = wintypes.BOOL
+
+
 @dataclass
 class MonitorInfo:
     index: int
@@ -53,8 +120,14 @@ class MonitorInfo:
     width: int
     height: int
     is_primary: bool
-    handle: int | None
+    hmonitor: int
     controllable: bool
+    current_input: int | None = None
+
+    @property
+    def handle(self) -> int | None:
+        """Back-compat alias: a live physical handle is opened per DDC call."""
+        return self.hmonitor if self.controllable else None
 
     @property
     def label(self) -> str:
@@ -99,14 +172,38 @@ def input_name(value: int | None) -> str:
     return INPUT_SOURCE_NAMES.get(value, f"0x{value:02X}")
 
 
-def get_input_source(handle: int) -> int | None:
+@contextmanager
+def _physical_monitors(hmonitor: int):
+    count = wintypes.DWORD()
+    if not dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(
+        wintypes.HMONITOR(hmonitor), ctypes.byref(count)
+    ):
+        yield ()
+        return
+    if count.value == 0:
+        yield ()
+        return
+
+    physical_array = (PHYSICAL_MONITOR * count.value)()
+    if not dxva2.GetPhysicalMonitorsFromHMONITOR(
+        wintypes.HMONITOR(hmonitor), count.value, physical_array
+    ):
+        yield ()
+        return
+    try:
+        yield physical_array
+    finally:
+        dxva2.DestroyPhysicalMonitors(count.value, physical_array)
+
+
+def _get_vcp_input(handle) -> int | None:
     current = wintypes.DWORD()
     maximum = wintypes.DWORD()
-    supported = wintypes.DWORD()
+    vcp_type = wintypes.DWORD()
     ok = dxva2.GetVCPFeatureAndVCPFeatureReply(
-        wintypes.HANDLE(handle),
+        handle,
         wintypes.BYTE(VCP_INPUT_SELECT),
-        ctypes.byref(supported),
+        ctypes.byref(vcp_type),
         ctypes.byref(current),
         ctypes.byref(maximum),
     )
@@ -115,32 +212,104 @@ def get_input_source(handle: int) -> int | None:
     return _decode_vcp_input(int(current.value))
 
 
-def set_input_source(handle: int, value: int, state_key: str | None = None) -> None:
-    ok = dxva2.SetVCPFeature(
-        wintypes.HANDLE(handle),
-        wintypes.BYTE(VCP_INPUT_SELECT),
-        wintypes.DWORD(value),
+def _set_vcp_input(handle, value: int) -> bool:
+    ctypes.set_last_error(0)
+    return bool(
+        dxva2.SetVCPFeature(
+            handle,
+            wintypes.BYTE(VCP_INPUT_SELECT),
+            wintypes.DWORD(value),
+        )
     )
-    if not ok:
-        raise OSError(ctypes.get_last_error(), "SetVCPFeature failed")
-    _write_last_input(state_key or str(handle), value)
+
+
+def _read_from_hmonitor(hmonitor: int) -> tuple[str, bool, int | None]:
+    description = "Unknown monitor"
+    controllable = False
+    current = None
+    with _physical_monitors(hmonitor) as physicals:
+        if not physicals:
+            return description, False, None
+        for physical in physicals:
+            text = physical.szPhysicalMonitorDescription.strip()
+            if text:
+                description = text
+            handle = physical.hPhysicalMonitor
+            if handle in (None, 0):
+                continue
+            controllable = True
+            current = _get_vcp_input(handle)
+            if current is not None:
+                break
+    return description, controllable, current
+
+
+def get_input_source(monitor: MonitorInfo) -> int | None:
+    with _ddc_session():
+        _desc, _ok, current = _read_from_hmonitor(monitor.hmonitor)
+        return current
+
+
+def _try_set_on_hmonitor(hmonitor: int, value: int) -> bool:
+    with _physical_monitors(hmonitor) as physicals:
+        if not physicals:
+            return False
+        for physical in physicals:
+            handle = physical.hPhysicalMonitor
+            if handle in (None, 0):
+                continue
+            _get_vcp_input(handle)
+            time.sleep(0.04)
+            if _set_vcp_input(handle, value):
+                return True
+        return False
+
+
+def set_input_source(monitor: MonitorInfo, value: int, state_key: str | None = None) -> None:
+    key = state_key or monitor.device_name
+    last_error = 0
+    with _ddc_session():
+        for attempt, delay in enumerate(_SET_DELAYS, start=1):
+            if _try_set_on_hmonitor(monitor.hmonitor, value):
+                _write_last_input(key, value)
+                return
+            last_error = ctypes.get_last_error()
+            time.sleep(delay)
+    raise OSError(
+        last_error,
+        f"SetVCPFeature failed after {len(_SET_DELAYS)} attempts "
+        f"({monitor.position}: {monitor.description})",
+    )
 
 
 def switch_monitors_to_inputs(
     monitors: list[MonitorInfo],
     assignments: list[tuple[MonitorInfo, int]],
-) -> list[str]:
-    """Set explicit inputs on multiple monitors. Returns status lines."""
+) -> tuple[list[str], int, int]:
+    """Set explicit inputs on multiple monitors.
+
+    Returns (status lines, successes, failures).
+    """
     lines: list[str] = []
-    for monitor, target in assignments:
-        if not monitor.controllable or monitor.handle is None:
+    successes = 0
+    failures = 0
+    for index, (monitor, target) in enumerate(assignments):
+        if index:
+            time.sleep(_MULTI_MONITOR_GAP)
+        if not monitor.controllable:
             lines.append(f"[{monitor.position}] skipped (not controllable)")
+            failures += 1
             continue
-        set_input_source(monitor.handle, target, monitor.device_name)
-        lines.append(
-            f"[{monitor.position}] {monitor.description} -> {input_name(target)}"
-        )
-    return lines
+        try:
+            set_input_source(monitor, target, monitor.device_name)
+            successes += 1
+            lines.append(
+                f"[{monitor.position}] {monitor.description} -> {input_name(target)}"
+            )
+        except OSError as exc:
+            failures += 1
+            lines.append(f"[{monitor.position}] failed: {exc}")
+    return lines, successes, failures
 
 
 def _state_path():
@@ -168,10 +337,6 @@ def _save_state(data: dict) -> None:
     import json
 
     _state_path().write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-
-
-def _pc_state_path():
-    return _state_path()
 
 
 def read_active_pc(group_id: str = "default") -> str:
@@ -202,28 +367,48 @@ def toggle_pc_group(
     input_key = "input_b" if target_pc == "b" else "input_a"
 
     assignments: list[tuple[MonitorInfo, int]] = []
+    missing: list[str] = []
     for entry in monitor_configs:
         if not entry.get("enabled", True):
             continue
         monitor = resolve_monitor(monitors, entry)
         if monitor is None:
+            missing.append(str(entry.get("monitor") or entry.get("device") or "?"))
             continue
         assignments.append((monitor, int(entry[input_key])))
 
-    lines = switch_monitors_to_inputs(monitors, assignments)
-    write_active_pc(target_pc, group_id)
+    lines, successes, failures = switch_monitors_to_inputs(monitors, assignments)
+    for name in missing:
+        lines.append(f"[{name}] monitor not found")
+        failures += 1
+
+    if successes and not failures:
+        write_active_pc(target_pc, group_id)
+        return target_name, lines
+
+    if successes:
+        lines.append(
+            f"Partial switch to {target_name} ({successes} ok, {failures} failed). "
+            "State was not flipped — press the hotkey again to retry."
+        )
+        return target_name, lines
+
+    lines.append(
+        f"Could not switch to {target_name}. Kept previous PC state so the next "
+        "press retries the same target."
+    )
     return target_name, lines
 
 
 def toggle_input(
-    handle: int,
+    monitor: MonitorInfo,
     input_a: int,
     input_b: int,
     state_key: str | None = None,
 ) -> tuple[int, int]:
     """Toggle between two input sources. Returns (previous, new)."""
-    key = state_key or str(handle)
-    current = get_input_source(handle)
+    key = state_key or monitor.device_name
+    current = get_input_source(monitor)
     last = _read_last_input(key)
 
     if current == input_a:
@@ -237,7 +422,7 @@ def toggle_input(
     else:
         target = input_b
 
-    set_input_source(handle, target, state_key=key)
+    set_input_source(monitor, target, state_key=key)
     previous = current if current is not None else (last if last is not None else -1)
     return previous, target
 
@@ -277,37 +462,8 @@ def _position_name(index: int, total: int) -> str:
     return f"screen-{index + 1}"
 
 
-def _is_controllable(description: str, handle: int | None) -> bool:
-    if not handle:
-        return False
-    return True
-
-
-def _read_physical_monitor(
-    hmonitor: wintypes.HMONITOR,
-) -> tuple[str, int | None]:
-    count = wintypes.DWORD()
-    if not dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(hmonitor, ctypes.byref(count)):
-        return "Unknown monitor", None
-    if count.value == 0:
-        return "Unknown monitor", None
-
-    physical_array = (PHYSICAL_MONITOR * count.value)()
-    if not dxva2.GetPhysicalMonitorsFromHMONITOR(
-        hmonitor, count.value, physical_array
-    ):
-        return "Unknown monitor", None
-
-    physical = physical_array[0]
-    description = physical.szPhysicalMonitorDescription.strip() or "Unknown monitor"
-    handle_value = physical.hPhysicalMonitor
-    if handle_value in (None, 0):
-        return description, None
-    return description, int(handle_value)
-
-
 def enumerate_monitors(controllable_only: bool = False) -> list[MonitorInfo]:
-    entries: list[tuple[MONITORINFOEXW, str, int | None]] = []
+    entries: list[tuple[MONITORINFOEXW, int]] = []
 
     @ctypes.WINFUNCTYPE(
         wintypes.BOOL,
@@ -321,8 +477,7 @@ def enumerate_monitors(controllable_only: bool = False) -> list[MonitorInfo]:
         info.cbSize = ctypes.sizeof(MONITORINFOEXW)
         if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
             return True
-        description, handle = _read_physical_monitor(hmonitor)
-        entries.append((info, description, handle))
+        entries.append((info, int(hmonitor)))
         return True
 
     if not user32.EnumDisplayMonitors(None, None, callback, 0):
@@ -332,8 +487,9 @@ def enumerate_monitors(controllable_only: bool = False) -> list[MonitorInfo]:
     total = len(entries)
     result: list[MonitorInfo] = []
 
-    for index, (info, description, handle) in enumerate(entries):
+    for index, (info, hmonitor) in enumerate(entries):
         rect = info.rcMonitor
+        description, controllable, current = _read_from_hmonitor(hmonitor)
         monitor = MonitorInfo(
             index=index,
             position=_position_name(index, total),
@@ -344,8 +500,9 @@ def enumerate_monitors(controllable_only: bool = False) -> list[MonitorInfo]:
             width=rect.right - rect.left,
             height=rect.bottom - rect.top,
             is_primary=bool(info.dwFlags & 1),
-            handle=handle,
-            controllable=_is_controllable(description, handle),
+            hmonitor=hmonitor,
+            controllable=controllable,
+            current_input=current,
         )
         if controllable_only and not monitor.controllable:
             continue
@@ -403,11 +560,7 @@ def print_monitor_list(monitors: list[MonitorInfo]) -> None:
     print(f"Found {len(monitors)} display(s), {len(controllable)} controllable via DDC/CI:\n")
 
     for monitor in monitors:
-        if monitor.controllable and monitor.handle is not None:
-            current = get_input_source(monitor.handle)
-        else:
-            current = None
-
+        current = monitor.current_input
         status = "switchable" if monitor.controllable else "not switchable (no DDC/CI handle)"
         print(f"  [{monitor.position}] {monitor.description} - {status}")
         print(f"    Device: {monitor.device_name}")
