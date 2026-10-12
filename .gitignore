@@ -2,6 +2,10 @@
 .switcher_state.json
 switcher_state.json
 deck_selection.json
+peer_seen.json
+peer_wake.json
+proxmox/config.json
+proxmox/keys/*.png
 
 # Logs
 *.log

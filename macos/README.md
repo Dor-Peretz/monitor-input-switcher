@@ -134,6 +134,12 @@ On Windows set `local_pc` to `"b"` and `peer_url` to this Mac’s `http://…:87
 Use the same `token` on both sides when you set one. Leave VirtualHere running
 on both computers. The Windows client is `vhui64.exe`.
 
+If one computer turns off, the one that is still on takes the deck. If both
+are off, the one that wakes up takes it. While neither computer is using the
+deck, proxmox2 shows **Turn on Mac**, **Turn on PC**, and the **HA** folder
+on the keys. The same three controls are on the **Off** page in Elgato, one
+press of Next from the monitor page. Wake-on-LAN has to be enabled on both.
+
 Drag **Mac / PC** onto a key on both computers. Pressing it runs this plugin
 (`launch.sh` on the Mac, `launch.bat` on Windows) and does not touch monitors.
 

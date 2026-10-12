@@ -138,6 +138,13 @@ The deck stays plugged into an always-on VirtualHere server (this desk:
 deck to the other computer. Monitor switching does not move it. This PC is
 `local_pc: "b"`.
 
+If one computer turns off, the one that is still on takes the deck. If both
+are off, the one that wakes up takes it. While neither computer is using the
+deck, proxmox2 draws **Turn on Mac**, **Turn on PC**, and the **HA** folder
+on the keys (`proxmox/standby_deck.py`). Wake-on-LAN has to be enabled on
+both computers. The **Off** page on each computer's Elgato profile has the
+same three controls for when that computer is the one awake.
+
 ```json
 "streamdeck_hub": {
   "enabled": true,

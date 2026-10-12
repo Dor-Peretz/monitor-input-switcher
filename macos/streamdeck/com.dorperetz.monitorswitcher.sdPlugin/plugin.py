@@ -479,6 +479,13 @@ class Plugin:
         self._show_deck(target)
         log(f"Deck switch -> {note}")
 
+    def _do_wake(self, settings: dict) -> None:
+        from streamdeck_hub import wake_machine
+
+        target = str((settings or {}).get("target") or "a").strip().lower()
+        note = wake_machine("b" if target == "b" else "a")
+        log(f"Wake -> {note}")
+
     def _do_pc_switch(self) -> None:
         config = load_config()
         pc_switch = config.get("pc_switch", {})

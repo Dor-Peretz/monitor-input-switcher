@@ -16,6 +16,7 @@
     "peer_url": "",
     "token": "",
     "client_path": "",
-    "device_match": "Stream Deck"
+    "device_match": "Stream Deck",
+    "follow_power": true
   }
 }

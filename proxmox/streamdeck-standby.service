@@ -1,0 +1,14 @@
+[Unit]
+Description=Stream Deck standby screen when the Mac and PC are off
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/streamdeck-standby
+ExecStart=/usr/bin/python3 /opt/streamdeck-standby/standby_deck.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

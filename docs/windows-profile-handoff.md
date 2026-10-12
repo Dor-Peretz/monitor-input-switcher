@@ -91,7 +91,27 @@ The target string is the monitor name, typed exactly. The property inspector lis
 
 **PC Switch** is monitors only. It does not hand the deck to the other computer. **Mac / PC** does not change monitor inputs.
 
-## 5. Monitor config
+## 5. Off page
+
+Add one more page, directly after the monitor page, so Next from that page opens it. Title it **Off**. Same Home Assistant plugin as the **HA** folder. Do not press the keys.
+
+| Key | Title | Action |
+|---|---|---|
+| 0,0 | Turn on Mac | **Turn On Computer**, setting `target` = `a` |
+| 1,0 | Turn on PC | **Turn On Computer**, setting `target` = `b` |
+| 2,0 | HA | Elgato **Create Folder** opening the same **HA** folder from the first page |
+| 0,2 | Previous Page | Elgato **Previous Page** |
+| 4,2 | Next Page | Elgato **Next Page** |
+
+```text
+Turn on Mac   Turn on PC   HA
+
+Previous                                 Next
+```
+
+**Turn on Mac** and **Turn on PC** send a wake packet. They do nothing useful until each computer has been on once so the other side can learn its address. The **HA** folder is the same folder as on the first page, not a second copy of the light keys.
+
+## 6. Monitor config
 
 Merge this into `pc_switch`. Do not delete `streamdeck_hub` or the other settings.
 
@@ -142,6 +162,7 @@ Quit and reopen Stream Deck after the plugin and the config are in place.
 ## Done when
 
 - The **HA** folder is on the first page at column 1 row 0, with the seven keys in the positions above.
+- The **Off** page is the next page after the monitor keys, with Turn on Mac, Turn on PC, and that same HA folder.
 - The lights page matches the second table, including the script used for Bright Red.
 - **Mac / PC**, **PC Switch**, and both **Toggle Monitor Input** keys are on the second page at 3,0 / 4,0 / 3,1 / 4,1.
 - `pc_switch` in the config that the app actually reads matches the JSON above.

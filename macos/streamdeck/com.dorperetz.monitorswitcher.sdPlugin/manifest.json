@@ -72,6 +72,28 @@
       ]
     },
     {
+      "Icon": "imgs/action-deck",
+      "Name": "Turn On Computer",
+      "UUID": "com.dorperetz.monitorswitcher.wake",
+      "Tooltip": "Turn on the Mac or the PC. The key setting target is a for the Mac and b for the PC.",
+      "SupportedInMultiActions": true,
+      "Controllers": ["Keypad"],
+      "States": [
+        {
+          "Image": "imgs/deck-mac",
+          "TitleAlignment": "bottom",
+          "FontSize": "11",
+          "TitleColor": "#ffffff"
+        },
+        {
+          "Image": "imgs/deck-pc",
+          "TitleAlignment": "bottom",
+          "FontSize": "11",
+          "TitleColor": "#ffffff"
+        }
+      ]
+    },
+    {
       "Icon": "imgs/action-input",
       "Name": "Toggle Monitor Input",
       "UUID": "com.dorperetz.monitorswitcher.input",

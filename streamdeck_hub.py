@@ -5,6 +5,10 @@ The deck stays plugged into an always-on VirtualHere server (proxmox2).
 The Mac / PC key hands the deck to the other computer. Monitor switching
 is separate and does not move the deck.
 
+When one computer turns off, the one that is still on takes the deck.
+When both are off, the one that wakes up takes it. Wake-on-LAN addresses
+are learned from the other computer while it is on.
+
 No extra packages. The other machine is reached with a small HTTP listener
 that this module starts inside the menu-bar app, the tray app, and the
 Stream Deck plugin.
@@ -12,10 +16,12 @@ Stream Deck plugin.
 
 from __future__ import annotations
 
+import ctypes
 import hmac
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -36,6 +42,16 @@ _MAC_CLIENT = (
 
 _started = False
 _start_lock = threading.Lock()
+_client_lock = threading.RLock()
+_suspend_follow = False
+_MAC_ADDRESS = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
+# kIOMessage* from IOKit/pwr_mgt/IOPMLibDefs.h
+_IO_CAN_SLEEP = 0xE0000270
+_IO_WILL_SLEEP = 0xE0000280
+_IO_WILL_NOT_SLEEP = 0xE0000290
+_IO_HAS_POWERED_ON = 0xE0000300
+_PBT_APMSUSPEND = 0x0004
+_PBT_APMRESUMEAUTOMATIC = 0x0012
 
 
 def _log(message: str) -> None:
@@ -68,6 +84,7 @@ def hub_settings() -> dict:
         "device_match": str(raw.get("device_match") or "Stream Deck"),
         "label_a": str(raw.get("label_a") or "Mac"),
         "label_b": str(raw.get("label_b") or "PC"),
+        "follow_power": bool(raw.get("follow_power", True)),
     }
 
 
@@ -117,6 +134,11 @@ def _run_client(command: str, settings: dict | None = None) -> str:
     pass ``-r`` and read the reply from a temp file (VirtualHere docs).
     """
     binary = client_path(settings)
+    with _client_lock:
+        return _run_client_locked(binary, command)
+
+
+def _run_client_locked(binary: str, command: str) -> str:
     reply_path: Path | None = None
     argv = [binary, "-t", command]
     if sys.platform == "win32":
@@ -202,11 +224,412 @@ def release_local() -> str:
     return f"released {deck['name']}"
 
 
+SEEN_PEER_FILE = Path(__file__).resolve().parent / "peer_seen.json"
+WAKE_FILE = Path(__file__).resolve().parent / "peer_wake.json"
+_lan_mac_cache: tuple[float, str] | None = None
+
+
+def _valid_mac(value: str) -> bool:
+    return bool(_MAC_ADDRESS.match(value.strip().lower()))
+
+
+def _normalize_mac(value: str) -> str:
+    text = value.strip().lower().replace("-", ":")
+    return text if _valid_mac(text) else ""
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolved_peer_url(settings: dict | None = None) -> str:
+    """Configured peer, or the address the other computer last called from."""
+    settings = settings or hub_settings()
+    if settings["peer_url"]:
+        return settings["peer_url"]
+    return str(_read_json(SEEN_PEER_FILE).get("peer_url") or "").rstrip("/")
+
+
+def remember_peer_host(host: str) -> None:
+    """The other computer calls us on 8765. Remember it when peer_url is blank."""
+    if not host:
+        return
+    if host.startswith("::ffff:"):
+        host = host[7:]
+    if host in ("127.0.0.1", "::1") or ":" in host:
+        return
+    settings = hub_settings()
+    url = f"http://{host}:{settings['listen_port']}"
+    if settings["peer_url"]:
+        return
+    current = _read_json(SEEN_PEER_FILE).get("peer_url")
+    if current == url:
+        return
+    SEEN_PEER_FILE.write_text(json.dumps({"peer_url": url}) + "\n", encoding="utf-8")
+    _log(f"Learned the other computer at {url}")
+
+
+def known_wake_mac(which: str) -> str:
+    saved = _read_json(WAKE_FILE).get("b" if which == "b" else "a")
+    return _normalize_mac(str(saved or ""))
+
+
+def remember_wake_mac(which: str, mac: str) -> None:
+    which = "b" if which == "b" else "a"
+    mac = _normalize_mac(mac)
+    if not mac:
+        return
+    data = _read_json(WAKE_FILE)
+    if data.get(which) == mac:
+        return
+    data[which] = mac
+    WAKE_FILE.write_text(json.dumps(data) + "\n", encoding="utf-8")
+    _log(f"Learned wake address for {owner_name(which)}")
+
+
+def local_lan_mac() -> str:
+    """MAC of this computer's LAN adapter, for the other side's wake packet."""
+    global _lan_mac_cache
+    if _lan_mac_cache and time.monotonic() - _lan_mac_cache[0] < 60:
+        return _lan_mac_cache[1]
+    mac = _read_lan_mac()
+    _lan_mac_cache = (time.monotonic(), mac)
+    return mac
+
+
+def _read_lan_mac() -> str:
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["ifconfig"], capture_output=True, text=True, timeout=5, check=False
+        )
+        current = {"mac": "", "ips": []}
+        blocks: list[dict] = []
+        for line in (result.stdout or "").splitlines():
+            if line and not line[0].isspace():
+                if current["mac"] or current["ips"]:
+                    blocks.append(current)
+                current = {"mac": "", "ips": []}
+                continue
+            stripped = line.strip()
+            if stripped.startswith("ether "):
+                current["mac"] = _normalize_mac(stripped.split()[1])
+            elif stripped.startswith("inet ") and not stripped.startswith("inet6"):
+                ip = stripped.split()[1]
+                if ip != "127.0.0.1":
+                    current["ips"].append(ip)
+        if current["mac"] or current["ips"]:
+            blocks.append(current)
+        for block in blocks:
+            if block["mac"] and any(ip.startswith("192.168.68.") for ip in block["ips"]):
+                return block["mac"]
+        for block in blocks:
+            if block["mac"] and block["ips"]:
+                return block["mac"]
+        return ""
+    result = subprocess.run(
+        ["getmac", "/fo", "csv", "/v", "/nh"],
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    for line in (result.stdout or "").splitlines():
+        if "disconnected" in line.lower() or "hardware not present" in line.lower():
+            continue
+        for part in line.split(","):
+            mac = _normalize_mac(part.strip().strip('"'))
+            if mac and not mac.startswith("00:00:00"):
+                return mac
+    return ""
+
+
+def build_wol_packet(mac: str) -> bytes:
+    mac_bytes = bytes.fromhex(_normalize_mac(mac).replace(":", ""))
+    if len(mac_bytes) != 6:
+        raise ValueError("wake address must be a 6-byte MAC")
+    return b"\xff" * 6 + mac_bytes * 16
+
+
+def send_wol(mac: str) -> None:
+    packet = build_wol_packet(mac)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(packet, ("255.255.255.255", 9))
+        sock.sendto(packet, ("255.255.255.255", 7))
+    finally:
+        sock.close()
+
+
+def wake_machine(which: str) -> str:
+    """Turn on the Mac (``a``) or the PC (``b``) with a wake-on-LAN packet."""
+    which = "b" if str(which).strip().lower() == "b" else "a"
+    settings = hub_settings()
+    if which == settings["local_pc"]:
+        return f"{owner_name(which)} is already on"
+    mac = known_wake_mac(which)
+    if not mac:
+        raise RuntimeError(
+            f"No wake address for {owner_name(which)} yet. "
+            "Leave that computer on once so this one can learn it."
+        )
+    send_wol(mac)
+    note = f"wake sent to {owner_name(which)}"
+    _log(note)
+    return note
+
+
+def peer_status(settings: dict | None = None) -> dict | None:
+    """Health of the other computer. None when it does not answer.
+
+    An HTTP error still counts as up: an older build has no /health route.
+    """
+    settings = settings or hub_settings()
+    peer = resolved_peer_url(settings)
+    if not peer:
+        return None
+    request = urllib.request.Request(peer + "/health", method="GET")
+    token = settings["token"]
+    if token:
+        request.add_header("X-Hub-Token", token)
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError:
+        return {"ok": True}
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    try:
+        data = json.loads(raw) if raw else {"ok": True}
+    except json.JSONDecodeError:
+        return {"ok": True}
+    if not isinstance(data, dict):
+        return {"ok": True}
+    remember_wake_mac(str(data.get("local_pc") or ""), str(data.get("wol_mac") or ""))
+    return data
+
+
+def claim_if_alone() -> str | None:
+    """Take the deck when the other computer is off and we do not hold it."""
+    global _suspend_follow
+    if _suspend_follow:
+        return None
+    settings = hub_settings()
+    if not settings["enabled"] or not settings["follow_power"]:
+        return None
+    if not resolved_peer_url(settings):
+        return None
+    if peer_status(settings) is not None:
+        return None
+    deck = _find_deck(settings)
+    if deck["in_use_by_me"]:
+        return None
+    note = claim_local()
+    write_selected(settings["local_pc"])
+    _log(f"Other computer is off; took the Stream Deck. {note}")
+    return note
+
+
+def release_for_power_off() -> str:
+    """Give the deck to the computer that is still on, before we sleep."""
+    global _suspend_follow
+    _suspend_follow = True
+    settings = hub_settings()
+    if not settings["enabled"] or not settings["follow_power"]:
+        return "power follow is off"
+    if peer_status(settings) is not None:
+        local = release_local()
+        peer = _post_peer("/claim")
+        note = f"sleep handoff: {local}; {peer}"
+    else:
+        note = "sleep handoff: " + release_local()
+    _log(note)
+    return note
+
+
+def _follow_loop() -> None:
+    misses = 0
+    announced = False
+    while True:
+        time.sleep(4)
+        try:
+            settings = hub_settings()
+            if not settings["enabled"] or not settings["follow_power"]:
+                continue
+            if not resolved_peer_url(settings):
+                if not announced:
+                    _log("Power follow is waiting until the other computer calls, or peer_url is set.")
+                    announced = True
+                continue
+            announced = False
+            if _suspend_follow:
+                continue
+            if peer_status(settings) is not None:
+                misses = 0
+                continue
+            misses += 1
+            if misses < 3:
+                continue
+            claim_if_alone()
+        except Exception as exc:
+            _log(f"Power follow: {exc}")
+
+
+def _after_wake() -> None:
+    global _suspend_follow
+    _suspend_follow = False
+    time.sleep(3)
+    try:
+        note = claim_if_alone()
+        if note:
+            _log(f"Woke up and took the Stream Deck. {note}")
+    except Exception as exc:
+        _log(f"Wake claim failed: {exc}")
+
+
+def _power_callback_mac(message_type: int) -> None:
+    global _suspend_follow
+    if message_type == _IO_WILL_SLEEP:
+        done = threading.Event()
+
+        def work() -> None:
+            try:
+                release_for_power_off()
+            except Exception as exc:
+                _log(f"Sleep handoff failed: {exc}")
+            finally:
+                done.set()
+
+        threading.Thread(target=work, daemon=True).start()
+        done.wait(5)
+    elif message_type == _IO_WILL_NOT_SLEEP:
+        _suspend_follow = False
+    elif message_type == _IO_HAS_POWERED_ON:
+        threading.Thread(target=_after_wake, name="streamdeck-wake", daemon=True).start()
+
+
+def _start_mac_power_hook() -> None:
+    iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+    core = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    callback_type = ctypes.CFUNCTYPE(
+        None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p
+    )
+    root_port = 0
+
+    def _callback(_refcon, _service, message_type, message_argument):
+        try:
+            _power_callback_mac(int(message_type))
+        except Exception as exc:
+            _log(f"Power callback failed: {exc}")
+        if message_type in (_IO_CAN_SLEEP, _IO_WILL_SLEEP):
+            iokit.IOAllowPowerChange(root_port, message_argument)
+
+    callback = callback_type(_callback)
+    # Keep the callback alive for the process lifetime.
+    globals()["_POWER_CALLBACK"] = callback
+    port_ref = ctypes.c_void_p()
+    notifier = ctypes.c_uint32()
+    iokit.IORegisterForSystemPower.restype = ctypes.c_uint32
+    iokit.IORegisterForSystemPower.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        callback_type,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    iokit.IOAllowPowerChange.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+    iokit.IONotificationPortGetRunLoopSource.restype = ctypes.c_void_p
+    iokit.IONotificationPortGetRunLoopSource.argtypes = [ctypes.c_void_p]
+    root_port = iokit.IORegisterForSystemPower(
+        None, ctypes.byref(port_ref), callback, ctypes.byref(notifier)
+    )
+    if not root_port:
+        _log("Could not register for Mac sleep and wake.")
+        return
+    source = iokit.IONotificationPortGetRunLoopSource(port_ref)
+    core.CFRunLoopGetCurrent.restype = ctypes.c_void_p
+    core.CFStringCreateWithCString.restype = ctypes.c_void_p
+    core.CFStringCreateWithCString.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_uint32,
+    ]
+    core.CFRunLoopAddSource.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    mode = core.CFStringCreateWithCString(None, b"kCFRunLoopDefaultMode", 0x08000100)
+    core.CFRunLoopAddSource(core.CFRunLoopGetCurrent(), source, mode)
+    _log("Watching Mac sleep and wake.")
+    core.CFRunLoopRun()
+
+
+def _start_windows_power_hook() -> None:
+    callback_type = ctypes.WINFUNCTYPE(
+        ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p
+    )
+
+    def _callback(_context, type_, _setting):
+        try:
+            if type_ == _PBT_APMSUSPEND:
+                done = threading.Event()
+
+                def work() -> None:
+                    try:
+                        release_for_power_off()
+                    except Exception as exc:
+                        _log(f"Sleep handoff failed: {exc}")
+                    finally:
+                        done.set()
+
+                threading.Thread(target=work, daemon=True).start()
+                done.wait(5)
+            elif type_ == _PBT_APMRESUMEAUTOMATIC:
+                threading.Thread(target=_after_wake, name="streamdeck-wake", daemon=True).start()
+        except Exception as exc:
+            _log(f"Power callback failed: {exc}")
+        return 0
+
+    callback = callback_type(_callback)
+
+    class _Subscribe(ctypes.Structure):
+        _fields_ = [("Callback", callback_type), ("Context", ctypes.c_void_p)]
+
+    params = _Subscribe(callback, None)
+    globals()["_POWER_CALLBACK"] = callback
+    globals()["_POWER_PARAMS"] = params
+    powrprof = ctypes.WinDLL("powrprof")
+    powrprof.RegisterSuspendResumeNotification.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    powrprof.RegisterSuspendResumeNotification.restype = ctypes.c_void_p
+    handle = powrprof.RegisterSuspendResumeNotification(ctypes.byref(params), 2)
+    if not handle:
+        _log("Could not register for Windows sleep and wake.")
+        return
+    globals()["_POWER_HANDLE"] = handle
+    _log("Watching Windows sleep and wake.")
+
+
+def start_power_follow() -> None:
+    """Claim the deck when we are the computer that is on."""
+    threading.Thread(target=_follow_loop, name="streamdeck-power", daemon=True).start()
+    if sys.platform == "darwin":
+        threading.Thread(
+            target=_start_mac_power_hook, name="streamdeck-sleep", daemon=True
+        ).start()
+    elif sys.platform == "win32":
+        _start_windows_power_hook()
+
+
 def _post_peer(path: str) -> str:
     settings = hub_settings()
-    if not settings["peer_url"]:
+    peer = resolved_peer_url(settings)
+    if not peer:
         return "other computer not configured (streamdeck_hub.peer_url)"
-    url = settings["peer_url"] + path
+    url = peer + path
     request = urllib.request.Request(url, data=b"", method="POST")
     token = settings["token"]
     if token:
@@ -275,7 +698,7 @@ def toggle_deck_owner(target: str | None = None) -> str:
     if target not in ("a", "b"):
         target = "b" if previous == "a" else "a"
     sending_away = target != settings["local_pc"]
-    if sending_away and not settings["peer_url"]:
+    if sending_away and not resolved_peer_url(settings):
         raise RuntimeError(
             "Set streamdeck_hub.peer_url to the other computer before handing the deck away."
         )
@@ -302,13 +725,28 @@ def toggle_deck_owner(target: str | None = None) -> str:
 
 
 class _HubHandler(BaseHTTPRequestHandler):
-    def do_POST(self) -> None:  # noqa: N802
-        settings = hub_settings()
-        token = settings["token"]
-        got = self.headers.get("X-Hub-Token", "")
-        if token and not hmac.compare_digest(got, token):
-            self._reply(403, "forbidden")
+    def do_GET(self) -> None:  # noqa: N802
+        if not self._authorized():
             return
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path != "/health":
+            self._reply(404, "not found")
+            return
+        self._note_caller()
+        settings = hub_settings()
+        body = json.dumps(
+            {
+                "ok": True,
+                "local_pc": settings["local_pc"],
+                "wol_mac": local_lan_mac(),
+            }
+        )
+        self._reply(200, body)
+
+    def do_POST(self) -> None:  # noqa: N802
+        if not self._authorized():
+            return
+        self._note_caller()
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         try:
             if path == "/claim":
@@ -324,6 +762,22 @@ class _HubHandler(BaseHTTPRequestHandler):
             return
         _log(f"{path} -> {message}")
         self._reply(200, message)
+
+    def _authorized(self) -> bool:
+        settings = hub_settings()
+        token = settings["token"]
+        got = self.headers.get("X-Hub-Token", "")
+        if token and not hmac.compare_digest(got, token):
+            self._reply(403, "forbidden")
+            return False
+        return True
+
+    def _note_caller(self) -> None:
+        try:
+            host = self.client_address[0]
+        except (IndexError, TypeError):
+            return
+        remember_peer_host(str(host))
 
     def _reply(self, status: int, message: str) -> None:
         body = message.encode("utf-8")
@@ -356,6 +810,7 @@ def ensure_hub_listener() -> None:
             return
         _started = True
         threading.Thread(target=server.serve_forever, name="streamdeck-hub", daemon=True).start()
+        start_power_follow()
         _log(
             f"Hub listener on {settings['listen_host']}:{settings['listen_port']} "
             f"(this computer is {settings['label_a'] if settings['local_pc'] == 'a' else settings['label_b']})"
@@ -365,15 +820,23 @@ def ensure_hub_listener() -> None:
 def main() -> int:
     """`python3 streamdeck_hub.py claim|release|status` for a manual check."""
     command = (sys.argv[1] if len(sys.argv) > 1 else "status").lower()
+    target = sys.argv[2] if len(sys.argv) > 2 else ""
     if command == "claim":
         print(claim_local())
     elif command == "release":
         print(release_local())
+    elif command == "wake":
+        print(wake_machine(target or "b"))
     elif command == "status":
         settings = hub_settings()
-        print(json.dumps({"settings": settings, "devices": parse_list(_run_client("LIST", settings))}, indent=2))
+        print(json.dumps({
+            "settings": settings,
+            "peer_url": resolved_peer_url(settings),
+            "wake": {"a": known_wake_mac("a"), "b": known_wake_mac("b")},
+            "devices": parse_list(_run_client("LIST", settings)),
+        }, indent=2))
     else:
-        print("Use claim, release, or status.", file=sys.stderr)
+        print("Use claim, release, wake, or status.", file=sys.stderr)
         return 2
     return 0
 
