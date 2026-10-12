@@ -104,6 +104,8 @@ Errors go to `streamdeck.log` in this folder.
 
 Windows setup, in order, is
 [docs/windows-streamdeck-handoff.md](../docs/windows-streamdeck-handoff.md).
+The matching **HA** folder and monitor keys are in
+[docs/windows-profile-handoff.md](../docs/windows-profile-handoff.md).
 
 This key is separate from monitor switching. **PC Switch** and the hotkeys
 only change monitor inputs. **Mac / PC** hands the Stream Deck itself to the

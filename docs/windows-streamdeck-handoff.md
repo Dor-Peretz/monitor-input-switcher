@@ -132,3 +132,5 @@ Someone on the Mac then sets `macos/config.json` → `streamdeck_hub.peer_url` t
 - Port 8765 is listening.
 - The **Mac / PC** key is on the Windows Stream Deck profile.
 - You have reported `PC_IP`.
+
+The **HA** folder and the monitor keys are a second checklist: [windows-profile-handoff.md](windows-profile-handoff.md). Do that after this file, so the Windows profile matches the Mac.

@@ -130,7 +130,8 @@ GitHub Actions builds the `.exe`, zips it, and attaches both to a GitHub Release
 
 Windows setup is a checklist in
 [docs/windows-streamdeck-handoff.md](docs/windows-streamdeck-handoff.md).
-Start there on the PC.
+Start there on the PC. The matching **HA** folder and monitor keys are in
+[docs/windows-profile-handoff.md](docs/windows-profile-handoff.md).
 
 The deck stays plugged into an always-on VirtualHere server (this desk:
 **proxmox2**, `192.168.68.70`, TCP `7575`). The **Mac / PC** key hands the
