@@ -111,8 +111,8 @@ Write it in both places when both exist:
       "enabled": true,
       "monitor": "left",
       "device": "DELL P2721Q",
-      "input_a": 15,
-      "input_b": 17
+      "input_a": 17,
+      "input_b": 15
     },
     {
       "enabled": true,
@@ -133,7 +133,7 @@ Write it in both places when both exist:
 | 17 | HDMI-1 |
 | 27 | USB-C |
 
-Left monitor **DELL P2721Q**: Mac side is 15, other side is 17. Right monitor **DELL U2720Q**: Mac side is 15, other side is 27. Keep those codes even though the Mac-side label says HDMI.
+Left monitor **DELL P2721Q**: Mac side is 17 (HDMI), other side is 15. Right monitor **DELL U2720Q**: Mac side is 15, other side is 27.
 
 The hotkey is `ctrl+shift+1` because this is Windows. The Mac hotkey uses the Command key and is not copied here.
 

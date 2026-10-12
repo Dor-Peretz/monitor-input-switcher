@@ -39,6 +39,7 @@ from sdclient import StreamDeckClient  # noqa: E402
 ACTION_PC_SWITCH = "com.dorperetz.monitorswitcher.pcswitch"
 ACTION_INPUT = "com.dorperetz.monitorswitcher.input"
 ACTION_DECK = "com.dorperetz.monitorswitcher.deck"
+ACTION_WAKE = "com.dorperetz.monitorswitcher.wake"
 
 LOG_FILE = APP_DIR / "streamdeck.log"
 REFRESH_SECONDS = 1.5
@@ -156,7 +157,7 @@ def image_uri(name: str) -> str:
 
 def image_for(action: str, state: int) -> str:
     mac = state == 0
-    if action == ACTION_DECK:
+    if action in (ACTION_DECK, ACTION_WAKE):
         return "deck-mac" if mac else "deck-pc"
     if action == ACTION_PC_SWITCH:
         return "pc-a" if mac else "pc-b"
@@ -284,6 +285,15 @@ class Plugin:
             return 0, "Deck"
         return (0 if owner == "a" else 1), owner_name(owner)
 
+    def _wake_view(self, settings: dict) -> tuple[int, str]:
+        from streamdeck_hub import owner_name
+
+        target = str((settings or {}).get("target") or "a").strip().lower()
+        if target not in ("a", "b"):
+            target = "a"
+        state = 0 if target == "a" else 1
+        return state, f"Turn on\n{owner_name(target)}"
+
     def _pc_switch_view(self) -> tuple[int, str]:
         config = load_config()
         pc_switch = config.get("pc_switch", {})
@@ -326,6 +336,8 @@ class Plugin:
                 state, title = self._pc_switch_view()
             elif entry["action"] == ACTION_DECK:
                 state, title = self._deck_view()
+            elif entry["action"] == ACTION_WAKE:
+                state, title = self._wake_view(entry["settings"])
             else:
                 state, title = self._input_view(entry["settings"])
         except (DDCError, OSError, ValueError) as exc:
@@ -367,6 +379,8 @@ class Plugin:
                     self._do_pc_switch()
                 elif entry["action"] == ACTION_DECK:
                     self._do_deck_switch()
+                elif entry["action"] == ACTION_WAKE:
+                    self._do_wake(settings or entry["settings"])
                 else:
                     self._do_input_toggle(settings or entry["settings"])
                 self.client.send("showOk", context=context)
@@ -455,9 +469,14 @@ class Plugin:
     def _do_deck_switch(self) -> None:
         from streamdeck_hub import displayed_owner, toggle_deck_owner
 
-        target = "b" if displayed_owner() == "a" else "a"
+        previous = displayed_owner()
+        target = "b" if previous == "a" else "a"
+        try:
+            note = toggle_deck_owner(target)
+        except Exception:
+            self._show_deck(previous)
+            raise
         self._show_deck(target)
-        note = toggle_deck_owner(target)
         log(f"Deck switch -> {note}")
 
     def _do_pc_switch(self) -> None:

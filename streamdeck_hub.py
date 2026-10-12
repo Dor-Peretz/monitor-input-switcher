@@ -264,33 +264,38 @@ def owner_name(which: str) -> str:
 def toggle_deck_owner(target: str | None = None) -> str:
     """Hand the Stream Deck to the computer that does not have it.
 
-    Monitor inputs are not touched. The chosen side is saved first so the
-    key face can update even when the other computer cannot take the deck.
-    If that handoff fails, this machine claims the deck back.
+    Monitor inputs are not touched. The chosen side is saved only after the
+    handoff is accepted. A failed press leaves the key on the computer that
+    still has the deck.
     """
     settings = hub_settings()
     if not settings["enabled"]:
         raise RuntimeError("Stream Deck hub is off in config.json")
+    previous = displayed_owner()
     if target not in ("a", "b"):
-        target = "b" if displayed_owner() == "a" else "a"
-    write_selected(target)
+        target = "b" if previous == "a" else "a"
     sending_away = target != settings["local_pc"]
     if sending_away and not settings["peer_url"]:
         raise RuntimeError(
             "Set streamdeck_hub.peer_url to the other computer before handing the deck away."
         )
-    if sending_away:
-        local = release_local()
-        peer = _post_peer("/claim")
-        if "unreachable" in peer or "not configured" in peer:
-            try:
-                claim_local()
-            except Exception as exc:
-                _log(f"Could not take the deck back: {exc}")
-            raise RuntimeError(peer)
-    else:
-        peer = _post_peer("/release")
-        local = claim_local()
+    write_selected(target)
+    try:
+        if sending_away:
+            local = release_local()
+            peer = _post_peer("/claim")
+            if "unreachable" in peer or "not configured" in peer:
+                try:
+                    claim_local()
+                except Exception as exc:
+                    _log(f"Could not take the deck back: {exc}")
+                raise RuntimeError(peer)
+        else:
+            peer = _post_peer("/release")
+            local = claim_local()
+    except Exception:
+        write_selected(previous)
+        raise
     note = f"{owner_name(target)}: {local}; {peer}"
     _log(note)
     return note
