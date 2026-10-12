@@ -6,6 +6,7 @@ from __future__ import annotations
 import ctypes
 import threading
 import tkinter as tk
+from copy import deepcopy
 from tkinter import messagebox, ttk
 
 from config_store import (
@@ -823,6 +824,10 @@ class MonitorSwitcherUI:
                 "pc_b_name": self.pc_b_name.get().strip() or "PC 2",
                 "monitors": pc_monitors,
             },
+            # Keep Mac/PC Stream Deck handoff settings across UI saves.
+            "streamdeck_hub": deepcopy(
+                self.config.get("streamdeck_hub") or {}
+            ),
         }
 
     def save(self) -> None:

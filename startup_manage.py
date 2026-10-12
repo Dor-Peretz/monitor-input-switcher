@@ -15,6 +15,10 @@ REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 def launch_command() -> str:
     if is_frozen():
         return f'"{executable_path()}"'
+    # Source installs: start VirtualHere + Stream Deck + tray together.
+    stack = app_dir() / "start_desk_stack.vbs"
+    if stack.is_file():
+        return f'wscript.exe "{stack}"'
     tray = app_dir() / "tray_app.py"
     return f'"{pythonw_path()}" "{tray}"'
 

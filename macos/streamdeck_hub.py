@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -110,18 +111,44 @@ def parse_list(text: str) -> list[dict]:
 
 
 def _run_client(command: str, settings: dict | None = None) -> str:
+    """Run a VirtualHere client API command against the already-running client.
+
+    On Windows the GUI client does not write IPC replies to stdout, so we
+    pass ``-r`` and read the reply from a temp file (VirtualHere docs).
+    """
     binary = client_path(settings)
-    result = subprocess.run(
-        [binary, "-t", command],
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    output = ((result.stdout or "") + (result.stderr or "")).strip()
-    if result.returncode != 0 and not output.startswith("OK"):
-        raise RuntimeError(output or f"VirtualHere exited {result.returncode}")
-    return output
+    reply_path: Path | None = None
+    argv = [binary, "-t", command]
+    if sys.platform == "win32":
+        handle = tempfile.NamedTemporaryFile(
+            prefix="vh-ipc-", suffix=".txt", delete=False
+        )
+        handle.close()
+        reply_path = Path(handle.name)
+        argv.extend(["-r", str(reply_path)])
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        output = ((result.stdout or "") + (result.stderr or "")).strip()
+        if reply_path is not None:
+            try:
+                output = reply_path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                pass
+        if result.returncode != 0 and not output.startswith("OK"):
+            raise RuntimeError(output or f"VirtualHere exited {result.returncode}")
+        return output
+    finally:
+        if reply_path is not None:
+            try:
+                reply_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _find_deck(settings: dict | None = None) -> dict:
@@ -147,11 +174,22 @@ def _disable_auto_use(deck: dict, settings: dict) -> dict:
 def claim_local() -> str:
     """Take the Stream Deck on this computer."""
     settings = hub_settings()
-    deck = _disable_auto_use(_find_deck(settings), settings)
-    if deck["in_use_by_me"] and not deck["auto_use"]:
-        return f"already on this computer ({deck['name']})"
-    _run_client(f"USE,{deck['address']}", settings)
-    return f"claimed {deck['name']}"
+    last_error: Exception | None = None
+    for attempt in range(1, 6):
+        deck = _disable_auto_use(_find_deck(settings), settings)
+        if deck["in_use_by_me"] and not deck["auto_use"]:
+            return f"already on this computer ({deck['name']})"
+        try:
+            _run_client(f"USE,{deck['address']}", settings)
+            deck = _find_deck(settings)
+            if deck["in_use_by_me"]:
+                return f"claimed {deck['name']}"
+            last_error = RuntimeError("USE returned but device is not in use by this computer")
+        except Exception as exc:
+            last_error = exc
+            _log(f"claim attempt {attempt} failed: {exc}")
+        time.sleep(1.0)
+    raise RuntimeError(str(last_error) if last_error else "claim failed")
 
 
 def release_local() -> str:

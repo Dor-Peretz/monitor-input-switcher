@@ -496,7 +496,9 @@ class Plugin:
 
         input_a = parse_input_value(binding.get("input_a"))
         input_b = parse_input_value(binding.get("input_b"))
-        previous, new = toggle_input(monitor.handle, input_a, input_b, monitor.device_name)
+        # Windows toggle_input takes MonitorInfo; macOS takes the DDC handle.
+        target = monitor if sys.platform == "win32" else monitor.handle
+        previous, new = toggle_input(target, input_a, input_b, monitor.device_name)
         previous_label = input_name(previous) if previous >= 0 else "unknown"
         log(f"[{monitor.position}] {monitor.description}: {previous_label} -> {input_name(new)}")
 

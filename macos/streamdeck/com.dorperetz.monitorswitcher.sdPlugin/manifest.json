@@ -53,6 +53,7 @@
       "Name": "Mac / PC",
       "UUID": "com.dorperetz.monitorswitcher.deck",
       "Tooltip": "Hand this Stream Deck to the Mac or the PC. Does not change monitors.",
+      "PropertyInspectorPath": "propertyinspector/deck.html",
       "SupportedInMultiActions": true,
       "Controllers": ["Keypad"],
       "States": [

@@ -248,11 +248,12 @@ def _read_from_hmonitor(hmonitor: int) -> tuple[str, bool, int | None]:
             text = physical.szPhysicalMonitorDescription.strip()
             if text:
                 description = text
+            # Some GPU drivers return a NULL physical-monitor HANDLE even when
+            # VCP 0x60 still works for this HMONITOR. Probe VCP either way.
             handle = physical.hPhysicalMonitor
-            if handle in (None, 0):
-                continue
-            controllable = True
             current = _get_vcp_input(handle)
+            if current is not None or handle not in (None, 0):
+                controllable = True
             if current is not None:
                 break
     return description, controllable, current
@@ -270,8 +271,6 @@ def _try_set_on_hmonitor(hmonitor: int, value: int) -> bool:
             return False
         for physical in physicals:
             handle = physical.hPhysicalMonitor
-            if handle in (None, 0):
-                continue
             _get_vcp_input(handle)
             time.sleep(0.04)
             if _set_vcp_input(handle, value):
@@ -459,6 +458,11 @@ def _read_last_input(state_key: str) -> int | None:
     return None
 
 
+def read_last_input(state_key: str) -> int | None:
+    """Last input value written for a monitor, or None if never switched."""
+    return _read_last_input(state_key)
+
+
 def _write_last_input(state_key: str, value: int) -> None:
     data = _load_state()
     monitor_inputs = data.setdefault("monitor_inputs", {})
@@ -539,6 +543,11 @@ def resolve_monitor(monitors: list[MonitorInfo], entry: dict) -> MonitorInfo | N
         for monitor in monitors:
             if monitor.device_name.lower() == device:
                 return monitor
+        # Config from Mac uses model names like "DELL P2721Q"; match description.
+        for monitor in monitors:
+            desc = monitor.description.lower()
+            if device == desc or device in desc or desc.startswith(device):
+                return monitor
 
     selector = (entry.get("monitor") or "").strip().lower()
     if not selector:
@@ -551,6 +560,8 @@ def resolve_monitor(monitors: list[MonitorInfo], entry: dict) -> MonitorInfo | N
             monitor.device_name.lower(),
             monitor.description.lower(),
         }:
+            return monitor
+        if selector and selector in monitor.description.lower():
             return monitor
 
     aliases = {
