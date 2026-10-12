@@ -158,7 +158,6 @@ class Plugin:
         context = message.get("context")
         action = message.get("action")
         payload = message.get("payload") or {}
-
         if event in ("willAppear", "didReceiveSettings"):
             if not context:
                 return
@@ -200,10 +199,10 @@ class Plugin:
     # -- key rendering ---------------------------------------------------- #
 
     def _deck_view(self) -> tuple[int, str]:
-        from streamdeck_hub import current_owner, owner_name
+        from streamdeck_hub import displayed_owner, owner_name
 
         try:
-            owner = current_owner()
+            owner = displayed_owner()
         except Exception as exc:
             log(f"Deck status failed: {exc}")
             return 0, "Deck"
@@ -259,8 +258,7 @@ class Plugin:
         if self.signatures.get(context) == signature:
             return
         self.signatures[context] = signature
-        self.client.send("setState", context=context, payload={"state": state})
-        self.client.send("setTitle", context=context, payload={"title": title, "target": 0})
+        self._send_key_face(context, state, title)
 
     def refresh_all(self) -> None:
         for context in list(self.contexts):
@@ -300,10 +298,34 @@ class Plugin:
                 self.signatures.pop(context, None)
                 self.refresh_all()
 
-    def _do_deck_switch(self) -> None:
-        from streamdeck_hub import toggle_deck_owner
+    def _send_key_face(self, context: str, state: int, title: str) -> None:
+        """Update the physical key and the Stream Deck app window together."""
+        self.client.send("setState", context=context, payload={"state": state})
+        for target in (0, 2):
+            self.client.send(
+                "setTitle",
+                context=context,
+                payload={"title": title, "state": state, "target": target},
+            )
 
-        note = toggle_deck_owner()
+    def _show_deck(self, owner: str) -> None:
+        from streamdeck_hub import owner_name, write_selected
+
+        write_selected(owner)
+        state = 0 if owner == "a" else 1
+        title = owner_name(owner)
+        for context, entry in list(self.contexts.items()):
+            if entry.get("action") != ACTION_DECK:
+                continue
+            self.signatures[context] = f"{state}|{title}"
+            self._send_key_face(context, state, title)
+
+    def _do_deck_switch(self) -> None:
+        from streamdeck_hub import displayed_owner, toggle_deck_owner
+
+        target = "b" if displayed_owner() == "a" else "a"
+        self._show_deck(target)
+        note = toggle_deck_owner(target)
         log(f"Deck switch -> {note}")
 
     def _do_pc_switch(self) -> None:

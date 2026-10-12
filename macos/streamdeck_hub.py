@@ -181,6 +181,34 @@ def _post_peer(path: str) -> str:
     return body or "ok"
 
 
+SELECTION_FILE = Path(__file__).resolve().parent / "deck_selection.json"
+
+
+def read_selected() -> str | None:
+    try:
+        data = json.loads(SELECTION_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    owner = str(data.get("owner") or "")
+    return owner if owner in ("a", "b") else None
+
+
+def write_selected(owner: str) -> None:
+    which = "b" if owner == "b" else "a"
+    SELECTION_FILE.write_text(json.dumps({"owner": which}) + "\n", encoding="utf-8")
+
+
+def displayed_owner() -> str:
+    """Who the Stream Deck UI should show. Falls back to who holds the USB device."""
+    selected = read_selected()
+    if selected:
+        return selected
+    try:
+        return current_owner()
+    except Exception:
+        return hub_settings()["local_pc"]
+
+
 def current_owner() -> str:
     """``a`` when this machine holds the deck, otherwise ``b`` flipped from local_pc."""
     settings = hub_settings()
@@ -195,16 +223,19 @@ def owner_name(which: str) -> str:
     return settings["label_b"] if which == "b" else settings["label_a"]
 
 
-def toggle_deck_owner() -> str:
+def toggle_deck_owner(target: str | None = None) -> str:
     """Hand the Stream Deck to the computer that does not have it.
 
-    Monitor inputs are not touched. If the other computer cannot take the
-    deck, this machine claims it back.
+    Monitor inputs are not touched. The chosen side is saved first so the
+    key face can update even when the other computer cannot take the deck.
+    If that handoff fails, this machine claims the deck back.
     """
     settings = hub_settings()
     if not settings["enabled"]:
         raise RuntimeError("Stream Deck hub is off in config.json")
-    target = "b" if current_owner() == "a" else "a"
+    if target not in ("a", "b"):
+        target = "b" if displayed_owner() == "a" else "a"
+    write_selected(target)
     sending_away = target != settings["local_pc"]
     if sending_away and not settings["peer_url"]:
         raise RuntimeError(

@@ -1,6 +1,7 @@
 # Runtime state
 .switcher_state.json
 switcher_state.json
+deck_selection.json
 
 # Logs
 *.log

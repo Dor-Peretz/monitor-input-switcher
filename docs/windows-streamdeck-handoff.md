@@ -123,7 +123,7 @@ Reply with:
 - Whether port 8765 is listening
 - Anything that failed
 
-Someone on the Mac then sets `macos/config.json` → `streamdeck_hub.peer_url` to `http://PC_IP:8765` and reopens the Elgato app. Until that Mac field is set, the **Mac / PC** key stays on the Mac and shows an error instead of giving the deck away.
+Someone on the Mac then sets `macos/config.json` → `streamdeck_hub.peer_url` to `http://PC_IP:8765` and reopens the Elgato app. Until that Mac field is set, the **Mac / PC** key face still changes to PC, then shows an error, and the deck itself stays on the Mac.
 
 ## Done when
 
