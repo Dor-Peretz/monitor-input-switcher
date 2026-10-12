@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -29,6 +30,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -260,10 +262,11 @@ def remember_peer_host(host: str) -> None:
         return
     if host.startswith("::ffff:"):
         host = host[7:]
-    if host in ("127.0.0.1", "::1") or ":" in host:
+    if host in ("127.0.0.1", "::1"):
         return
+    url_host = f"[{host}]" if ":" in host else host
     settings = hub_settings()
-    url = f"http://{host}:{settings['listen_port']}"
+    url = f"http://{url_host}:{settings['listen_port']}"
     if settings["peer_url"]:
         return
     current = _read_json(SEEN_PEER_FILE).get("peer_url")
@@ -271,6 +274,195 @@ def remember_peer_host(host: str) -> None:
         return
     SEEN_PEER_FILE.write_text(json.dumps({"peer_url": url}) + "\n", encoding="utf-8")
     _log(f"Learned the other computer at {url}")
+
+
+def _mask_to_prefix(mask: str) -> int | None:
+    text = mask.strip().lower()
+    if text.startswith("0x"):
+        try:
+            bits = int(text, 16)
+        except ValueError:
+            return None
+        if bits < 0 or bits > 0xFFFFFFFF:
+            return None
+        return bin(bits).count("1")
+    try:
+        return ipaddress.IPv4Network(f"0.0.0.0/{text}").prefixlen
+    except (ValueError, TypeError):
+        return None
+
+
+def _interface_cidrs() -> list[tuple[str, int]]:
+    """Private IPv4 address and prefix for each connected interface."""
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["ifconfig"], capture_output=True, text=True, timeout=5, check=False
+        )
+        found: list[tuple[str, int]] = []
+        for line in (result.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[0] != "inet" or parts[2] != "netmask":
+                continue
+            prefix = _mask_to_prefix(parts[3])
+            if prefix is None:
+                continue
+            found.append((parts[1], prefix))
+        return found
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["netsh", "interface", "ipv4", "show", "addresses"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        text = result.stdout or ""
+        ips = re.findall(r"IP Address:\s+(\d+\.\d+\.\d+\.\d+)", text)
+        prefixes = [int(item) for item in re.findall(r"Subnet Prefix:\s+\S+/(\d+)", text)]
+        if ips and len(ips) == len(prefixes):
+            return list(zip(ips, prefixes))
+        return [(ip, 24) for ip in ips]
+    return []
+
+
+def peer_scan_hosts() -> list[str]:
+    """Hosts on this computer's private LAN, excluding our own addresses.
+
+    A prefix wider than /24 is narrowed to the /24 that contains our address
+    so a key press does not sweep a whole private /16.
+    """
+    own: set[str] = set()
+    networks: set[ipaddress.IPv4Network] = set()
+    for ip, prefix in _interface_cidrs():
+        try:
+            addr = ipaddress.IPv4Address(ip)
+        except ipaddress.AddressValueError:
+            continue
+        if addr.is_loopback or not addr.is_private:
+            continue
+        own.add(str(addr))
+        bounded = min(max(prefix, 24), 30)
+        try:
+            networks.add(ipaddress.IPv4Network(f"{addr}/{bounded}", strict=False))
+        except ipaddress.NetmaskValueError:
+            continue
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for network in sorted(networks, key=lambda item: (item.network_address, item.prefixlen)):
+        for host in network.hosts():
+            text = str(host)
+            if text in own or text in seen:
+                continue
+            seen.add(text)
+            hosts.append(text)
+    return hosts
+
+
+_discover_lock = threading.Lock()
+
+
+def _probe_hub(host: str, port: int, token: str, timeout: float) -> dict | None:
+    """Return /health JSON when this host is running the other side's hub."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        if sock.connect_ex((host, port)) != 0:
+            return None
+    except OSError:
+        return None
+    finally:
+        sock.close()
+    request = urllib.request.Request(f"http://{host}:{port}/health", method="GET")
+    if token:
+        request.add_header("X-Hub-Token", token)
+    try:
+        with urllib.request.urlopen(request, timeout=1.5) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        # A hub from before /health existed answers GET with 501 and
+        # "Unsupported method" in the body. Anything else on this port is ignored.
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except OSError:
+            body = ""
+        if exc.code == 501 and "Unsupported method" in body:
+            return {"legacy": True}
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    try:
+        data = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if str(data.get("local_pc") or "") not in ("a", "b"):
+        return None
+    return data
+
+
+def discover_peer_url(settings: dict | None = None) -> str:
+    """Find the other computer on the LAN when peer_url was never set.
+
+    The other side is only remembered after it calls us. Pressing Mac / PC on
+    this computer has to be able to go first, so an empty address is resolved
+    by asking who on the local network answers the hub health check as the
+    other computer.
+    """
+    settings = settings or hub_settings()
+    known = resolved_peer_url(settings)
+    if known:
+        return known
+    other = "b" if settings["local_pc"] == "a" else "a"
+    with _discover_lock:
+        known = resolved_peer_url(settings)
+        if known:
+            return known
+        hosts = peer_scan_hosts()
+        if not hosts:
+            _log("No private network to search for the other computer.")
+            return ""
+        _log(f"Looking for the other computer on the local network ({len(hosts)} addresses).")
+        port = int(settings["listen_port"])
+        token = str(settings["token"] or "")
+        found = ""
+        legacy: list[str] = []
+        workers = min(32, len(hosts))
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            pending = {
+                pool.submit(_probe_hub, host, port, token, 0.3): host for host in hosts
+            }
+            for future in as_completed(pending):
+                host = pending[future]
+                try:
+                    data = future.result()
+                except Exception:
+                    continue
+                if not data:
+                    continue
+                if str(data.get("local_pc") or "") == other:
+                    found = host
+                    break
+                if data.get("legacy"):
+                    legacy.append(host)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        if not found and len(legacy) == 1:
+            found = legacy[0]
+            _log(f"Found an older hub at {found}.")
+        elif not found and len(legacy) > 1:
+            _log(
+                "Several computers answered like an older hub ("
+                + ", ".join(legacy)
+                + "). Set streamdeck_hub.peer_url to the right one."
+            )
+        if not found:
+            _log("The other computer did not answer on this network.")
+            return ""
+        remember_peer_host(found)
+        return resolved_peer_url(settings)
 
 
 def known_wake_mac(which: str) -> str:
@@ -454,6 +646,7 @@ def release_for_power_off() -> str:
 def _follow_loop() -> None:
     misses = 0
     announced = False
+    next_discover = 0.0
     while True:
         time.sleep(4)
         try:
@@ -461,10 +654,14 @@ def _follow_loop() -> None:
             if not settings["enabled"] or not settings["follow_power"]:
                 continue
             if not resolved_peer_url(settings):
-                if not announced:
-                    _log("Power follow is waiting until the other computer calls, or peer_url is set.")
-                    announced = True
-                continue
+                if time.monotonic() >= next_discover:
+                    next_discover = time.monotonic() + 30
+                    discover_peer_url(settings)
+                if not resolved_peer_url(settings):
+                    if not announced:
+                        _log("Power follow is waiting until the other computer is found on the network.")
+                        announced = True
+                    continue
             announced = False
             if _suspend_follow:
                 continue
@@ -698,9 +895,10 @@ def toggle_deck_owner(target: str | None = None) -> str:
     if target not in ("a", "b"):
         target = "b" if previous == "a" else "a"
     sending_away = target != settings["local_pc"]
-    if sending_away and not resolved_peer_url(settings):
+    if sending_away and not resolved_peer_url(settings) and not discover_peer_url(settings):
         raise RuntimeError(
-            "Set streamdeck_hub.peer_url to the other computer before handing the deck away."
+            "Could not find the other computer on this network. "
+            "Open Stream Deck there, or set streamdeck_hub.peer_url."
         )
     write_selected(target)
     try:
