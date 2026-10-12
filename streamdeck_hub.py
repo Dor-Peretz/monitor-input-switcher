@@ -217,16 +217,23 @@ def _restart_streamdeck_soon() -> None:
                 _log(f"StreamDeck.exe not found at {exe}")
                 return
             # cmd.exe outlives the plugin; delay, kill, relaunch.
+            # Do not use `start "" "C:\...\exe"`: with DETACHED_PROCESS and
+            # redirected stdin, cmd's start treats that as the path `\\` and
+            # Windows pops "cannot find '\\'". ping delays survive NUL stdin;
+            # `timeout` does not. /D + the exe name avoids the empty-title trap.
+            folder = str(exe.parent)
             script = (
-                f'timeout /t 2 /nobreak >nul & '
-                f'taskkill /IM StreamDeck.exe /F >nul 2>&1 & '
-                f'timeout /t 1 /nobreak >nul & '
-                f'start "" "{exe}"'
+                f"ping -n 3 127.0.0.1 >nul & "
+                f"taskkill /IM StreamDeck.exe /F >nul 2>&1 & "
+                f"ping -n 2 127.0.0.1 >nul & "
+                f'start /d "{folder}" {exe.name}'
             )
             flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
             flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             subprocess.Popen(
                 ["cmd.exe", "/c", script],
+                cwd=folder,
                 creationflags=flags,
                 close_fds=True,
                 stdin=subprocess.DEVNULL,
@@ -860,10 +867,17 @@ def _start_windows_power_hook() -> None:
     params = _Subscribe(callback, None)
     globals()["_POWER_CALLBACK"] = callback
     globals()["_POWER_PARAMS"] = params
-    powrprof = ctypes.WinDLL("powrprof")
-    powrprof.RegisterSuspendResumeNotification.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    powrprof.RegisterSuspendResumeNotification.restype = ctypes.c_void_p
-    handle = powrprof.RegisterSuspendResumeNotification(ctypes.byref(params), 2)
+    # This API lives in user32, not powrprof. Looking it up on the wrong
+    # DLL raises and kills the tray before the hub listener stays up.
+    user32 = ctypes.WinDLL("user32")
+    try:
+        register = user32.RegisterSuspendResumeNotification
+    except AttributeError:
+        _log("RegisterSuspendResumeNotification missing; sleep handoff disabled.")
+        return
+    register.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    register.restype = ctypes.c_void_p
+    handle = register(ctypes.byref(params), 2)
     if not handle:
         _log("Could not register for Windows sleep and wake.")
         return
@@ -1089,7 +1103,10 @@ def ensure_hub_listener() -> None:
             return
         _started = True
         threading.Thread(target=server.serve_forever, name="streamdeck-hub", daemon=True).start()
-        start_power_follow()
+        try:
+            start_power_follow()
+        except Exception as exc:
+            _log(f"Power follow not started: {exc}")
         _log(
             f"Hub listener on {settings['listen_host']}:{settings['listen_port']} "
             f"(this computer is {settings['label_a'] if settings['local_pc'] == 'a' else settings['label_b']})"
