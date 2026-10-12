@@ -21,17 +21,18 @@ GREEN = (10, 112, 86)
 
 # name -> (background, glyph, big)
 # "big" centres the glyph; otherwise it sits above the title band.
+# State icons show which computer is active: Apple for the Mac, Windows for the PC.
 ICONS = {
     "plugin": (SLATE, "swap", True),
     "action-pc": (SLATE, "desk", True),
     "action-input": (SLATE, "swap", True),
-    "pc-a": (BLUE, "desk", False),
-    "pc-b": (GREEN, "desk", False),
-    "input-a": (BLUE, "swap", False),
-    "input-b": (GREEN, "swap", False),
+    "pc-a": (BLUE, "apple", False),
+    "pc-b": (GREEN, "windows", False),
+    "input-a": (BLUE, "apple", False),
+    "input-b": (GREEN, "windows", False),
     "action-deck": (SLATE, "swap", True),
-    "deck-mac": (BLUE, "swap", False),
-    "deck-pc": (GREEN, "swap", False),
+    "deck-mac": (BLUE, "apple", False),
+    "deck-pc": (GREEN, "windows", False),
 }
 
 
@@ -124,6 +125,28 @@ class Canvas:
                 elif inner - 0.7 <= distance <= radius + 0.7:
                     self.put(x, y, rgb, 0.4)
 
+    def shape(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        inside,
+        rgb: tuple[int, int, int],
+        samples: int = 4,
+    ) -> None:
+        """Fill every pixel where ``inside(x, y)`` holds, supersampled for smooth edges."""
+        total = samples * samples
+        for y in range(int(y0) - 1, int(y1) + 2):
+            for x in range(int(x0) - 1, int(x1) + 2):
+                hits = 0
+                for sy in range(samples):
+                    for sx in range(samples):
+                        if inside(x + (sx + 0.5) / samples, y + (sy + 0.5) / samples):
+                            hits += 1
+                if hits:
+                    self.put(x, y, rgb, hits / total)
+
 
 def _inside(
     px: float,
@@ -200,6 +223,46 @@ def draw_desk(canvas: Canvas, cx: float, cy: float, span: float) -> None:
     arrow(canvas, cx + inner / 2, cx - inner / 2, screen_cy + gap, arrow_w, WHITE)
 
 
+def draw_apple(canvas: Canvas, cx: float, cy: float, span: float) -> None:
+    """Apple logo: two-lobed body with a bite on the right and a tilted leaf."""
+    scale = span / 2
+
+    def circle(u: float, v: float, ox: float, oy: float, r: float) -> bool:
+        return (u - ox) ** 2 + (v - oy) ** 2 <= r * r
+
+    leaf_angle = math.radians(40)
+    cos_a, sin_a = math.cos(leaf_angle), math.sin(leaf_angle)
+
+    def inside(x: float, y: float) -> bool:
+        u, v = (x - cx) / scale, (y - cy) / scale
+        body = (
+            circle(u, v, -0.30, -0.08, 0.52)
+            or circle(u, v, 0.30, -0.08, 0.52)
+            or circle(u, v, -0.24, 0.32, 0.44)
+            or circle(u, v, 0.24, 0.32, 0.44)
+        )
+        if body and not circle(u, v, 0.80, -0.02, 0.27):
+            return True
+        lu, lv = u - 0.12, v + 0.86
+        ru = lu * cos_a + lv * sin_a
+        rv = -lu * sin_a + lv * cos_a
+        return (ru / 0.11) ** 2 + (rv / 0.25) ** 2 <= 1
+
+    canvas.shape(cx - scale, cy - scale * 1.2, cx + scale, cy + scale, inside, WHITE)
+
+
+def draw_windows(canvas: Canvas, cx: float, cy: float, span: float) -> None:
+    """Windows logo: four panes in a 2x2 grid."""
+    gap = span * 0.06
+    pane = (span - gap) / 2
+    left, top = cx - span / 2, cy - span / 2
+    for row in range(2):
+        for col in range(2):
+            x0 = left + col * (pane + gap)
+            y0 = top + row * (pane + gap)
+            canvas.round_rect(x0, y0, x0 + pane, y0 + pane, 0, WHITE)
+
+
 def png(size: int, pixels: bytearray) -> bytes:
     def chunk(tag: bytes, data: bytes) -> bytes:
         crc = zlib.crc32(tag + data) & 0xFFFFFFFF
@@ -233,6 +296,10 @@ def main() -> None:
             span = SIZE * 0.42
         if glyph == "swap":
             draw_swap(canvas, cx, cy, span)
+        elif glyph == "apple":
+            draw_apple(canvas, cx, cy, span)
+        elif glyph == "windows":
+            draw_windows(canvas, cx, cy, span)
         else:
             draw_desk(canvas, cx, cy, span)
         path = IMGS / f"{name}.png"
