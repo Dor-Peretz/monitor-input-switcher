@@ -34,6 +34,7 @@ DEFAULT_CONFIG: dict = {
         "monitors": [],
     },
     "streamdeck_hub": deepcopy(DEFAULT_STREAMDECK_HUB),
+    "layouts": {},
 }
 
 # Standard DDC/CI VCP 0x60 input source values (same codes m1ddc/ddcctl use).
@@ -110,6 +111,8 @@ def _ensure_pc_switch(data: dict) -> dict:
     if isinstance(hub, dict):
         merged.update(hub)
     data["streamdeck_hub"] = merged
+    if not isinstance(data.get("layouts"), dict):
+        data["layouts"] = {}
     return data
 
 

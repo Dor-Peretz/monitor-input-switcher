@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from config_store import DEFAULT_CONFIG, config_path, load_config, save_config
-from ddc_monitor import DDCError, enumerate_monitors, print_monitor_list
+from ddc_monitor import DDCError, apply_named_layout, enumerate_monitors, print_monitor_list
 from hotkey_service import HotkeyService, parse_input_value, run_toggle_cli
 
 
@@ -45,6 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("run", help="Listen for configured hotkeys (default)")
+
+    layout_parser = subparsers.add_parser(
+        "layout", help="Apply a named desk layout from config.json"
+    )
+    layout_parser.add_argument(
+        "name",
+        nargs="?",
+        default="office",
+        help="Layout name (default: office)",
+    )
     return parser
 
 
@@ -99,6 +109,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             run_toggle_cli(monitors, args.monitor, input_a, input_b)
+            return 0
+
+        if command == "layout":
+            for line in apply_named_layout(config, args.name):
+                print(line)
             return 0
 
         if command == "run":

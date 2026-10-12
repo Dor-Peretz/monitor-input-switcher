@@ -33,7 +33,19 @@ def empty_service() -> dict:
     return {"serviceId": "", "entityId": "", "serviceData": ""}
 
 
-def ha_settings(title: str, service_id: str, display_entity: str, service_data: str = "") -> dict:
+def ha_settings(
+    title: str,
+    service_id: str,
+    display_entity: str,
+    service_data: str = "",
+    service_entity: str = "",
+) -> dict:
+    """Build Entity (generic) settings.
+
+    For scripts, Mac uses serviceId like ``script.foo`` with an empty service
+    entity. That is valid HA (script-as-service). ``service_entity`` is only
+    needed for services such as ``light.toggle`` that require a target.
+    """
     domain = display_entity.split(".", 1)[0]
     return {
         "version": 8,
@@ -55,7 +67,7 @@ def ha_settings(title: str, service_id: str, display_entity: str, service_data: 
         "button": {
             "serviceShortPress": {
                 "serviceId": service_id,
-                "entityId": "",
+                "entityId": service_entity,
                 "serviceData": service_data,
             },
             "serviceLongPress": empty_service(),

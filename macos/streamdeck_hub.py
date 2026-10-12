@@ -195,6 +195,65 @@ def _disable_auto_use(deck: dict, settings: dict) -> dict:
     return _find_deck(settings)
 
 
+def _restart_streamdeck_soon() -> None:
+    """Quit/reopen Elgato after a VirtualHere claim so it sees the USB device.
+
+    Without this, Windows often keeps showing the old (empty) session until you
+    manually restart Stream Deck — which feels like having to reinstall it.
+
+    The restart runs in a *detached* process so it still finishes when claim was
+    handled inside the Stream Deck plugin (killing StreamDeck.exe would otherwise
+    kill this Python process mid-restart).
+    """
+    try:
+        if sys.platform == "win32":
+            exe = (
+                Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+                / "Elgato"
+                / "StreamDeck"
+                / "StreamDeck.exe"
+            )
+            if not exe.is_file():
+                _log(f"StreamDeck.exe not found at {exe}")
+                return
+            # cmd.exe outlives the plugin; delay, kill, relaunch.
+            script = (
+                f'timeout /t 2 /nobreak >nul & '
+                f'taskkill /IM StreamDeck.exe /F >nul 2>&1 & '
+                f'timeout /t 1 /nobreak >nul & '
+                f'start "" "{exe}"'
+            )
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            subprocess.Popen(
+                ["cmd.exe", "/c", script],
+                creationflags=flags,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _log("scheduled StreamDeck.exe restart after claim")
+        elif sys.platform == "darwin":
+            script = (
+                'sleep 2; '
+                'osascript -e \'quit app "Elgato Stream Deck"\' >/dev/null 2>&1; '
+                'sleep 1; '
+                'open -a "Elgato Stream Deck"'
+            )
+            subprocess.Popen(
+                ["/bin/sh", "-c", script],
+                start_new_session=True,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _log("scheduled Elgato Stream Deck restart after claim")
+    except Exception as exc:
+        _log(f"Stream Deck restart after claim failed: {exc}")
+
+
 def claim_local() -> str:
     """Take the Stream Deck on this computer."""
     settings = hub_settings()
@@ -207,6 +266,8 @@ def claim_local() -> str:
             _run_client(f"USE,{deck['address']}", settings)
             deck = _find_deck(settings)
             if deck["in_use_by_me"]:
+                # Fresh USB attach: Elgato will not see the deck until restarted.
+                _restart_streamdeck_soon()
                 return f"claimed {deck['name']}"
             last_error = RuntimeError("USE returned but device is not in use by this computer")
         except Exception as exc:

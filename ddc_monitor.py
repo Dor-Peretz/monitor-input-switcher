@@ -325,6 +325,37 @@ def switch_monitors_to_inputs(
     return lines, successes, failures
 
 
+def apply_named_layout(config: dict, name: str = "office") -> list[str]:
+    """Set the named desk layout on whatever monitors this computer currently drives."""
+    layout = (config.get("layouts") or {}).get(name)
+    if not isinstance(layout, dict):
+        raise ValueError(f"Unknown layout '{name}'")
+    entries = layout.get("assignments") or []
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"Layout '{name}' has no assignments")
+
+    monitors = enumerate_monitors()
+    assignments: list[tuple[MonitorInfo, int]] = []
+    lines: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("enabled") is False:
+            continue
+        monitor = resolve_monitor(monitors, entry)
+        label = str(entry.get("monitor") or entry.get("device") or "?")
+        if monitor is None:
+            lines.append(f"[{label}] not connected to this computer")
+            continue
+        try:
+            target = parse_input_value(entry["input"])
+        except (KeyError, TypeError, ValueError):
+            lines.append(f"[{label}] missing input code")
+            continue
+        assignments.append((monitor, target))
+
+    switched, _ok, _fail = switch_monitors_to_inputs(monitors, assignments)
+    return lines + switched
+
+
 def _state_path():
     from runtime_paths import is_frozen, user_data_dir
 
