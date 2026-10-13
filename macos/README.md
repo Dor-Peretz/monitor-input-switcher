@@ -34,6 +34,13 @@ pip3 install -r requirements.txt
 brew install python-tk
 ```
 
+Using the release zip instead of a git checkout? Unzip
+`MonitorInputSwitcher-macos-vX.Y.Z.zip` from
+[Releases](https://github.com/Dor-Peretz/monitor-input-switcher/releases) and
+`cd` into the unzipped folder instead of `macos`. It has the same layout,
+including `streamdeck/`. The Windows Stream Deck setup below still needs the
+full repo on the PC.
+
 ### Permissions
 
 Global hotkeys use the native macOS **Carbon `RegisterEventHotKey`** API, which
@@ -213,6 +220,9 @@ python3 startup_manage.py enable
 python3 startup_manage.py disable
 python3 startup_manage.py status
 ```
+
+Enabling writes the LaunchAgent; it takes effect at the next login and does
+not start a second copy now.
 
 ## Project layout
 

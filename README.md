@@ -97,18 +97,20 @@ pip install -r requirements.txt -r requirements-build.txt
 Output:
 
 - `dist\MonitorInputSwitcher.exe`
-- `dist\MonitorInputSwitcher-v1.0.0-win64.zip`
+- `dist\MonitorInputSwitcher-vX.Y.Z-win64.zip` (`X.Y.Z` is `__version__` from `version.py`)
 
 ## Publish a new release
 
 1. Bump `__version__` in `version.py` and `version_info.txt`.
 2. Commit and push to `main`.
-3. Create and push a tag:
+3. Create and push a tag that matches `version.py` (the workflow fails otherwise):
 
 ```powershell
-git tag v1.0.0
-git push origin v1.0.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
+
+Full checklist, including winget: [RELEASING.md](RELEASING.md).
 
 GitHub Actions builds the `.exe`, zips it, and attaches both to a GitHub Release automatically.
 

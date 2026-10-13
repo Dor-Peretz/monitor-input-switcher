@@ -197,12 +197,15 @@ def main() -> None:
     print(f"accessToken: length={len(token)}")
 
     quit_streamdeck()
-    patch_plugin_js(url, token)
-    start_streamdeck()
-    print("Stream Deck restarted — waiting for plugin to save global settings…")
-    time.sleep(6)
-    quit_streamdeck()
-    strip_bootstrap()
+    try:
+        patch_plugin_js(url, token)
+        start_streamdeck()
+        print("Stream Deck restarted — waiting for plugin to save global settings…")
+        time.sleep(6)
+        quit_streamdeck()
+    finally:
+        # The patched JS holds the token in plain text; never leave it behind.
+        strip_bootstrap()
     start_streamdeck()
     print("Done. HA keys should work; token is in the Windows Credential Store.")
 

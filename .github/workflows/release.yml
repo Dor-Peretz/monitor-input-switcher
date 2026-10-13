@@ -9,7 +9,24 @@ permissions:
   contents: write
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify tag matches version.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'from version import __version__; print(__version__)')"
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version.py (expected v$version)"
+            exit 1
+          fi
+
   build-windows:
+    needs: check-version
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -74,6 +91,11 @@ jobs:
           staging="MonitorInputSwitcher-macos-v$version"
           mkdir -p "$staging"
           cp macos/*.py macos/*.sh macos/requirements.txt macos/README.md macos/config.example.json "$staging"/
+          # menu_bar_app.py imports switch_progress from streamdeck/<plugin>/ next to it.
+          rsync -a --exclude '__pycache__/' --exclude '*.pyc' --exclude '.DS_Store' \
+            macos/streamdeck/ "$staging/streamdeck/"
+          test -f "$staging/streamdeck/com.dorperetz.monitorswitcher.sdPlugin/switch_progress.py"
+          test -x "$staging/streamdeck/install.sh"
           zip -r "$staging.zip" "$staging"
           echo "ZIP_PATH=$staging.zip" >> "$GITHUB_ENV"
 

@@ -2,7 +2,11 @@
 .switcher_state.json
 switcher_state.json
 .switch_progress.json
-.switch_progress.json.tmp
+.switch_progress.json.*
+*.tmp
+*.corrupt
+.switcher_state.json.lock
+.switcher_ddc.lock
 deck_selection.json
 peer_seen.json
 peer_wake.json
@@ -12,7 +16,8 @@ proxmox/keys/*.png
 # Logs
 *.log
 
-# Personal config (macOS auto-creates config.json from config.example.json)
+# Personal config (created from defaults or config.example.json on first run)
+/config.json
 macos/config.json
 config.json.bak.*
 
@@ -23,8 +28,13 @@ dist/
 MonitorInputSwitcher-macos-*/
 MonitorInputSwitcher-macos-*.zip
 
-# Python / env
+# Generated at runtime by tray_app.py (not used by the PyInstaller build)
 tray_icon.ico
+
+# OS
+.DS_Store
+
+# Python / env
 .venv/
 __pycache__/
 *.pyc

@@ -1,8 +1,9 @@
 # Created with YamlCreate.ps1 for winget submission.
-# Update InstallerUrl and InstallerSha256 for each release.
+# For each release, set PackageVersion and InstallerUrl to match version.py, then
+# replace InstallerSha256 with the hash of the released exe (see RELEASING.md).
 
 PackageIdentifier: DorPeretz.MonitorInputSwitcher
-PackageVersion: 1.0.0
+PackageVersion: 1.1.0
 PackageLocale: en-US
 Publisher: Dor Peretz
 PackageName: Monitor Input Switcher
@@ -17,7 +18,8 @@ Tags:
 Installers:
   - Architecture: x64
     InstallerType: portable
-    InstallerUrl: https://github.com/Dor-Peretz/monitor-input-switcher/releases/download/v1.0.0/MonitorInputSwitcher.exe
+    InstallerUrl: https://github.com/Dor-Peretz/monitor-input-switcher/releases/download/v1.1.0/MonitorInputSwitcher.exe
+    # TODO: must be filled from the v1.1.0 release asset before submitting; winget rejects this placeholder.
     InstallerSha256: REPLACE_WITH_SHA256
     Commands:
       - MonitorInputSwitcher
