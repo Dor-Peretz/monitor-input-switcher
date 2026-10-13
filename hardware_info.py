@@ -58,11 +58,12 @@ def _query_pnp_monitors() -> list[PnpMonitor]:
     )
     try:
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
             capture_output=True,
             text=True,
             check=True,
             timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
         return []

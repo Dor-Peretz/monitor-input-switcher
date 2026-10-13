@@ -64,6 +64,23 @@ def _log(message: str) -> None:
         pass
 
 
+def _run_hidden(argv: list[str], timeout: int) -> subprocess.CompletedProcess:
+    """Run a helper without flashing a Windows console or GUI window."""
+    kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "timeout": timeout,
+        "check": False,
+    }
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        kwargs["startupinfo"] = startupinfo
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    return subprocess.run(argv, **kwargs)
+
+
 def hub_settings() -> dict:
     from config_store import load_config
 
@@ -151,13 +168,7 @@ def _run_client_locked(binary: str, command: str) -> str:
         reply_path = Path(handle.name)
         argv.extend(["-r", str(reply_path)])
     try:
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
+        result = _run_hidden(argv, timeout=20)
         output = ((result.stdout or "") + (result.stderr or "")).strip()
         if reply_path is not None:
             try:
@@ -363,9 +374,7 @@ def _mask_to_prefix(mask: str) -> int | None:
 def _interface_cidrs() -> list[tuple[str, int]]:
     """Private IPv4 address and prefix for each connected interface."""
     if sys.platform == "darwin":
-        result = subprocess.run(
-            ["ifconfig"], capture_output=True, text=True, timeout=5, check=False
-        )
+        result = _run_hidden(["ifconfig"], timeout=5)
         found: list[tuple[str, int]] = []
         for line in (result.stdout or "").splitlines():
             parts = line.split()
@@ -377,12 +386,9 @@ def _interface_cidrs() -> list[tuple[str, int]]:
             found.append((parts[1], prefix))
         return found
     if sys.platform == "win32":
-        result = subprocess.run(
+        result = _run_hidden(
             ["netsh", "interface", "ipv4", "show", "addresses"],
-            capture_output=True,
-            text=True,
             timeout=8,
-            check=False,
         )
         text = result.stdout or ""
         ips = re.findall(r"IP Address:\s+(\d+\.\d+\.\d+\.\d+)", text)
@@ -563,9 +569,7 @@ def local_lan_mac() -> str:
 
 def _read_lan_mac() -> str:
     if sys.platform == "darwin":
-        result = subprocess.run(
-            ["ifconfig"], capture_output=True, text=True, timeout=5, check=False
-        )
+        result = _run_hidden(["ifconfig"], timeout=5)
         current = {"mac": "", "ips": []}
         blocks: list[dict] = []
         for line in (result.stdout or "").splitlines():
@@ -590,13 +594,7 @@ def _read_lan_mac() -> str:
             if block["mac"] and block["ips"]:
                 return block["mac"]
         return ""
-    result = subprocess.run(
-        ["getmac", "/fo", "csv", "/v", "/nh"],
-        capture_output=True,
-        text=True,
-        timeout=8,
-        check=False,
-    )
+    result = _run_hidden(["getmac", "/fo", "csv", "/v", "/nh"], timeout=8)
     for line in (result.stdout or "").splitlines():
         if "disconnected" in line.lower() or "hardware not present" in line.lower():
             continue
@@ -872,7 +870,7 @@ def _start_windows_power_hook() -> None:
     user32 = ctypes.WinDLL("user32")
     try:
         register = user32.RegisterSuspendResumeNotification
-    except AttributeError:
+    except (AttributeError, OSError):
         _log("RegisterSuspendResumeNotification missing; sleep handoff disabled.")
         return
     register.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
