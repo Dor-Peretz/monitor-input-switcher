@@ -39,6 +39,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 LOG_FILE = Path(__file__).resolve().parent / "streamdeck-hub.log"
+LOG_MAX_BYTES = 1_000_000
+_log_lock = threading.Lock()
 _DEVICE_LINE = re.compile(
     r"^\s*(\*?)-->\s+(?P<name>.+?)\s+\((?P<address>[^)]+)\)(?P<rest>.*)$"
 )
@@ -80,11 +82,17 @@ _PBT_APMRESUMEAUTOMATIC = 0x0012
 
 
 def _log(message: str) -> None:
-    try:
-        with LOG_FILE.open("a", encoding="utf-8") as handle:
-            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
-    except OSError:
-        pass
+    with _log_lock:
+        try:
+            if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
+                LOG_FILE.replace(LOG_FILE.with_suffix(".1.log"))
+        except OSError:
+            pass
+        try:
+            with LOG_FILE.open("a", encoding="utf-8") as handle:
+                handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+        except OSError:
+            pass
 
 
 def _run_hidden(argv: list[str], timeout: int) -> subprocess.CompletedProcess:
