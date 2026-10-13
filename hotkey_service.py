@@ -18,6 +18,8 @@ from ddc_monitor import (
     enumerate_monitors,
     find_monitor,
     input_name,
+    parse_input_value,
+    pc_switch_headline,
     resolve_monitor,
     toggle_input,
     toggle_pc_group,
@@ -118,15 +120,6 @@ def format_hotkey(modifiers: int, vk: int) -> str:
     return "+".join(parts)
 
 
-def parse_input_value(value: int | str) -> int:
-    if isinstance(value, int):
-        return value
-    text = str(value).strip().lower()
-    if text.startswith("0x"):
-        return int(text, 16)
-    return int(text)
-
-
 def build_registered_hotkeys(
     config: dict, _monitors: list[MonitorInfo] | None = None
 ) -> list[RegisteredHotkey]:
@@ -209,7 +202,8 @@ def build_registered_hotkeys(
                     name_a,
                     name_b,
                 )
-                return [f"Switched to {target_name}"] + lines
+                _ok, headline = pc_switch_headline(target_name, lines)
+                return [headline] + lines
 
             registered.append(
                 RegisteredHotkey(
@@ -225,69 +219,133 @@ def build_registered_hotkeys(
     return registered
 
 
-def _switch_progress():
-    lib = (
-        Path(__file__).resolve().parent
-        / "macos"
-        / "streamdeck"
-        / "com.dorperetz.monitorswitcher.sdPlugin"
-    )
-    folder = str(lib)
-    if folder not in sys.path:
-        sys.path.insert(0, folder)
-    import switch_progress
+_SWITCH_PROGRESS_DIR = (
+    Path(__file__).resolve().parent
+    / "macos"
+    / "streamdeck"
+    / "com.dorperetz.monitorswitcher.sdPlugin"
+)
+_switch_progress_module = None
+_switch_progress_unavailable = False
 
+
+def _switch_progress():
+    global _switch_progress_module, _switch_progress_unavailable
+    if _switch_progress_module is not None or _switch_progress_unavailable:
+        return _switch_progress_module
+    try:
+        import switch_progress
+    except ImportError:
+        folder = str(_SWITCH_PROGRESS_DIR)
+        if folder not in sys.path:
+            # Appended, not prepended, so plugin files never shadow app modules.
+            sys.path.append(folder)
+        try:
+            import switch_progress
+        except ImportError:
+            _switch_progress_unavailable = True
+            return None
+    _switch_progress_module = switch_progress
     return switch_progress
 
 
 def _begin_hotkey_progress(action: HotkeyAction) -> str:
+    module = _switch_progress()
+    if module is None:
+        return ""
     try:
-        return _switch_progress().begin_hotkey_progress(action.kind)
+        return module.begin_hotkey_progress(action.kind)
     except Exception:
         return ""
 
 
 def _end_hotkey_progress(token: str) -> None:
+    module = _switch_progress()
+    if module is None:
+        return
     try:
-        _switch_progress().end_progress(token)
+        module.end_progress(token)
     except Exception:
         pass
 
 
+class _ListenerRun:
+    """State owned by one listener thread, so a restart never touches it."""
+
+    def __init__(self) -> None:
+        self.stop_event = threading.Event()
+        self.ready_event = threading.Event()
+        self.registered: list[tuple[int, HotkeyAction]] = []
+        self.running = False
+        self.thread: threading.Thread | None = None
+
+
 class HotkeyService:
     def __init__(self) -> None:
-        self._thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
-        self._ready_event = threading.Event()
+        self._lock = threading.Lock()
+        self._run: _ListenerRun | None = None
+        self._worker: threading.Thread | None = None
+        self._action_queue: queue.Queue[HotkeyAction] = queue.Queue()
         self._event_queue: queue.Queue[list[str]] = queue.Queue()
         self._error_queue: queue.Queue[str] = queue.Queue()
-        self._registered: list[tuple[int, HotkeyAction]] = []
-        self._running = False
 
     @property
     def running(self) -> bool:
-        return self._running
+        run = self._run
+        return run is not None and run.running
 
     def start(self, config: dict | None = None) -> None:
-        if self._running:
-            self.stop()
         config = config or load_config()
-        self._stop_event.clear()
-        self._ready_event.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            args=(config,),
-            daemon=True,
-        )
-        self._thread.start()
-        self._ready_event.wait(timeout=2.0)
+        with self._lock:
+            self._stop_locked()
+            self._ensure_worker()
+            run = _ListenerRun()
+            run.thread = threading.Thread(
+                target=self._run_loop,
+                args=(config, run),
+                name="hotkey-listener",
+                daemon=True,
+            )
+            self._run = run
+            run.thread.start()
+            run.ready_event.wait(timeout=2.0)
 
     def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
-        self._thread = None
-        self._running = False
+        with self._lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        run = self._run
+        self._run = None
+        if run is None:
+            return
+        run.stop_event.set()
+        if run.thread and run.thread.is_alive():
+            run.thread.join(timeout=2)
+
+    def _ensure_worker(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._worker = threading.Thread(
+            target=self._work_loop,
+            name="hotkey-actions",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _work_loop(self) -> None:
+        # One worker for the service lifetime keeps DDC switches serialized,
+        # even across listener restarts.
+        while True:
+            action = self._action_queue.get()
+            token = _begin_hotkey_progress(action)
+            try:
+                self._event_queue.put(action.callback())
+            except Exception as exc:
+                self._event_queue.put([f"Error: {exc}"])
+            finally:
+                if token:
+                    _end_hotkey_progress(token)
 
     def poll_events(self) -> list[list[str]]:
         events: list[list[str]] = []
@@ -307,59 +365,53 @@ class HotkeyService:
                 break
         return errors
 
-    def _run_loop(self, config: dict) -> None:
+    def _run_loop(self, config: dict, run: _ListenerRun) -> None:
+        # RegisterHotKey(None, ...) binds to the calling thread's message
+        # queue, so registration, the message loop and UnregisterHotKey must
+        # all stay on this thread.
         try:
-            monitors = enumerate_monitors()
-            hotkeys = build_registered_hotkeys(config, monitors)
+            hotkeys = build_registered_hotkeys(config)
             if not hotkeys:
                 self._error_queue.put("No enabled hotkey bindings found.")
-                self._ready_event.set()
                 return
 
-            registered: list[tuple[int, HotkeyAction, str]] = []
             for index, item in enumerate(hotkeys, start=1):
                 modifiers, vk = parse_hotkey(item.hotkey)
                 if not user32.RegisterHotKey(None, index, modifiers | MOD_NOREPEAT, vk):
                     self._error_queue.put(
                         f"Could not register hotkey '{item.hotkey}'."
                     )
-                    for reg_id, _, _ in registered:
-                        user32.UnregisterHotKey(None, reg_id)
-                    self._ready_event.set()
                     return
-                registered.append((index, item.action, item.hotkey))
+                run.registered.append((index, item.action))
 
-            self._registered = [(item[0], item[1]) for item in registered]
-            self._running = True
-            self._ready_event.set()
+            run.running = True
+            run.ready_event.set()
 
             msg = MSG()
-            while not self._stop_event.is_set():
+            while not run.stop_event.is_set():
                 while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
                     if msg.message == WM_HOTKEY:
                         action = next(
-                            item[1]
-                            for item in self._registered
-                            if item[0] == msg.wParam
+                            (
+                                item[1]
+                                for item in run.registered
+                                if item[0] == msg.wParam
+                            ),
+                            None,
                         )
-                        token = _begin_hotkey_progress(action)
-                        try:
-                            lines = action.callback()
-                            self._event_queue.put(lines)
-                        except Exception as exc:
-                            self._event_queue.put([f"Error: {exc}"])
-                        finally:
-                            if token:
-                                _end_hotkey_progress(token)
+                        if action is not None:
+                            self._action_queue.put(action)
                     user32.TranslateMessage(ctypes.byref(msg))
                     user32.DispatchMessageW(ctypes.byref(msg))
                 time.sleep(0.05)
+        except Exception as exc:
+            self._error_queue.put(str(exc) or exc.__class__.__name__)
         finally:
-            for reg_id, _ in self._registered:
+            for reg_id, _ in run.registered:
                 user32.UnregisterHotKey(None, reg_id)
-            self._registered = []
-            self._running = False
-            self._ready_event.set()
+            run.registered.clear()
+            run.running = False
+            run.ready_event.set()
 
 
 def run_toggle_cli(

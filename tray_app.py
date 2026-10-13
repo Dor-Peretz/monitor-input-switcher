@@ -7,6 +7,7 @@ import ctypes
 import subprocess
 import threading
 import time
+from ctypes import wintypes
 from pathlib import Path
 
 import pystray
@@ -19,26 +20,47 @@ from version import __app_name__, __github_url__, __version__
 
 from runtime_paths import app_dir, is_frozen, settings_command, user_data_dir
 
-LOG_FILE = (user_data_dir() if is_frozen() else app_dir()) / "tray.log"
-ICON_FILE = (user_data_dir() if is_frozen() else app_dir()) / "tray_icon.ico"
+STATE_DIR = user_data_dir() if is_frozen() else app_dir()
+LOG_FILE = STATE_DIR / "tray.log"
+LOG_MAX_BYTES = 1_000_000
+ICON_FILE = STATE_DIR / "tray_icon.ico"
+STARTUP_MARKER = user_data_dir() / "startup_initialized"
 TRAY_TITLE = f"{__app_name__} v{__version__}"
 MUTEX_NAME = "MonitorInputSwitcherTray"
+ERROR_ALREADY_EXISTS = 183
 _mutex_handle = None
+_log_lock = threading.Lock()
 
 
 def log(message: str) -> None:
-    try:
-        with LOG_FILE.open("a", encoding="utf-8") as handle:
-            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
-    except OSError:
-        pass
+    with _log_lock:
+        try:
+            if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
+                LOG_FILE.replace(LOG_FILE.with_suffix(".1.log"))
+        except OSError:
+            pass
+        try:
+            with LOG_FILE.open("a", encoding="utf-8") as handle:
+                handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+        except OSError:
+            pass
 
 
 def acquire_single_instance() -> bool:
     global _mutex_handle
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    ]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
     _mutex_handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-    if kernel32.GetLastError() == 183:
+    last_error = ctypes.get_last_error()
+    if not _mutex_handle:
+        log(f"CreateMutexW failed (error {last_error}); skipping single-instance check.")
+        return True
+    if last_error == ERROR_ALREADY_EXISTS:
         log("Another tray instance is already running.")
         return False
     return True
@@ -69,21 +91,26 @@ class TrayApplication:
         self.service = HotkeyService()
         self.icon: pystray.Icon | None = None
         self._config_mtime = 0.0
+        self._config_error: str | None = None
         self._stop_watcher = threading.Event()
         self._startup_enabled = is_startup_enabled()
+        self._notify_lock = threading.Lock()
+        self._icon_ready = False
+        self._pending_notices: list[str] = []
 
     def run(self) -> None:
         if not acquire_single_instance():
             return
 
-        if not is_startup_enabled():
-            enable_startup()
-            self._startup_enabled = True
+        self._enable_startup_on_first_run()
 
         self._start_hotkeys()
-        from streamdeck_hub import ensure_hub_listener
+        try:
+            from streamdeck_hub import ensure_hub_listener
 
-        ensure_hub_listener()
+            ensure_hub_listener()
+        except Exception as exc:
+            log(f"Stream Deck hub listener not started: {exc}")
         watcher = threading.Thread(target=self._watch_config, daemon=True)
         watcher.start()
 
@@ -111,22 +138,52 @@ class TrayApplication:
         log("Starting tray icon.")
         self.icon.run(self._on_icon_ready)
 
+    def _enable_startup_on_first_run(self) -> None:
+        if STARTUP_MARKER.exists():
+            return
+        try:
+            if not is_startup_enabled():
+                enable_startup()
+                log("Enabled run at startup (first run).")
+            self._startup_enabled = True
+            STARTUP_MARKER.write_text(f"{__version__}\n", encoding="utf-8")
+        except OSError as exc:
+            log(f"Could not set up run at startup: {exc}")
+
     def _on_icon_ready(self, icon: pystray.Icon) -> None:
         icon.visible = True
-        self._notify("Running in background. Double-click to open settings.")
+        with self._notify_lock:
+            self._icon_ready = True
+            pending = self._pending_notices
+            self._pending_notices = []
+        if pending:
+            self._notify(" | ".join(pending)[:240])
+        else:
+            self._notify("Running in background. Double-click to open settings.")
 
-    def _start_hotkeys(self) -> None:
-        config = load_config()
+    def _start_hotkeys(self, repeat_errors: bool = True) -> bool:
         path = config_path()
-        if path.exists():
-            self._config_mtime = path.stat().st_mtime
+        try:
+            if path.exists():
+                self._config_mtime = path.stat().st_mtime
+            config = load_config()
+        except Exception as exc:
+            error = f"Could not read {path.name}: {exc}"
+            if repeat_errors or error != self._config_error:
+                log(error)
+                self._notify(error)
+            self._config_error = error
+            return False
+        self._config_error = None
         self.service.start(config)
         for error in self.service.poll_errors():
+            log(f"Hotkey error: {error}")
             self._notify(f"Hotkey error: {error}")
+        return True
 
     def reload_hotkeys(self, _icon=None, _item=None) -> None:
-        self._start_hotkeys()
-        self._notify("Hotkeys reloaded.")
+        if self._start_hotkeys():
+            self._notify("Hotkeys reloaded.")
 
     def open_settings(self, _icon=None, _item=None) -> None:
         subprocess.Popen(
@@ -157,25 +214,36 @@ class TrayApplication:
 
     def _watch_config(self) -> None:
         path = config_path()
-        time.sleep(2)
-        if path.exists():
-            self._config_mtime = path.stat().st_mtime
+        self._stop_watcher.wait(2)
         while not self._stop_watcher.is_set():
-            if path.exists():
-                mtime = path.stat().st_mtime
-                if mtime > self._config_mtime:
-                    self._config_mtime = mtime
-                    self.reload_hotkeys()
-            for event in self.service.poll_events():
-                summary = " | ".join(event)
-                log(summary)
-                self._notify(summary[:180])
-            for error in self.service.poll_errors():
-                log(f"Hotkey error: {error}")
-                self._notify(f"Hotkey error: {error}")
-            time.sleep(1.5)
+            try:
+                self._check_config(path)
+                self._report_service()
+            except Exception as exc:
+                log(f"Config watcher error: {exc}")
+            self._stop_watcher.wait(1.5)
+
+    def _check_config(self, path: Path) -> None:
+        changed = path.exists() and path.stat().st_mtime > self._config_mtime
+        # A failed read (e.g. a half-written file) is retried every tick.
+        if changed or self._config_error:
+            if self._start_hotkeys(repeat_errors=False):
+                self._notify("Hotkeys reloaded.")
+
+    def _report_service(self) -> None:
+        for event in self.service.poll_events():
+            summary = " | ".join(event)
+            log(summary)
+            self._notify(summary[:180])
+        for error in self.service.poll_errors():
+            log(f"Hotkey error: {error}")
+            self._notify(f"Hotkey error: {error}")
 
     def _notify(self, message: str) -> None:
+        with self._notify_lock:
+            if not self._icon_ready:
+                self._pending_notices.append(message)
+                return
         if self.icon:
             try:
                 self.icon.notify(message, TRAY_TITLE)

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import ctypes
+import json
+import os
+import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,36 +17,68 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
-VCP_INPUT_SELECT = 0x60
-_SET_DELAYS = (0.08, 0.16, 0.28, 0.45, 0.7)
-_MULTI_MONITOR_GAP = 0.22
-_DDC_MUTEX_NAME = "Local\\MonitorInputSwitcherDDC"
-_WAIT_MS = 8000
-_ddc_lock = threading.RLock()
-_ddc_mutex = kernel32.CreateMutexW(None, False, _DDC_MUTEX_NAME)
-
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
 kernel32.WaitForSingleObject.restype = wintypes.DWORD
 kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.ReleaseMutex.restype = wintypes.BOOL
 kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
-kernel32.CreateMutexW.restype = wintypes.HANDLE
-kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+
+VCP_INPUT_SELECT = 0x60
+_SET_DELAYS = (0.08, 0.16, 0.28, 0.45, 0.7)
+_MULTI_MONITOR_GAP = 0.22
+_DDC_MUTEX_NAME = "Local\\MonitorInputSwitcherDDC"
+_STATE_MUTEX_NAME = "Local\\MonitorInputSwitcherState"
+_WAIT_MS = 8000
+_STATE_WAIT_MS = 3000
+_STATE_READ_DELAYS = (0.02, 0.05, 0.1, 0.2)
+_STATE_REPLACE_DELAYS = (0.02, 0.05, 0.1, 0.2, 0.35)
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_ABANDONED = 0x00000080
+_ddc_lock = threading.RLock()
+_ddc_mutex = kernel32.CreateMutexW(None, False, _DDC_MUTEX_NAME)
+_state_lock = threading.RLock()
+_state_mutex = kernel32.CreateMutexW(None, False, _STATE_MUTEX_NAME)
+
+
+@contextmanager
+def _named_mutex(lock, mutex, wait_ms: int, timeout_message: str):
+    """Hold a thread lock plus a named Win32 mutex; both are reentrant per thread."""
+    with lock:
+        if mutex:
+            wait_result = kernel32.WaitForSingleObject(mutex, wait_ms)
+            if wait_result not in (_WAIT_OBJECT_0, _WAIT_ABANDONED):
+                raise OSError(timeout_message)
+        try:
+            yield
+        finally:
+            if mutex:
+                kernel32.ReleaseMutex(mutex)
 
 
 @contextmanager
 def _ddc_session():
     """Serialize DDC/CI across threads and between tray + settings processes."""
-    with _ddc_lock:
-        wait_result = 0
-        if _ddc_mutex:
-            wait_result = kernel32.WaitForSingleObject(_ddc_mutex, _WAIT_MS)
-            if wait_result not in (0, 0x00000080):  # WAIT_OBJECT_0, WAIT_ABANDONED
-                raise OSError("Timed out waiting for another switch to finish")
-        try:
-            yield
-        finally:
-            if _ddc_mutex:
-                kernel32.ReleaseMutex(_ddc_mutex)
+    with _named_mutex(
+        _ddc_lock, _ddc_mutex, _WAIT_MS, "Timed out waiting for another switch to finish"
+    ):
+        yield
+
+
+@contextmanager
+def _state_session():
+    """Serialize state-file read-modify-write across threads and processes.
+
+    Acquired while _ddc_session is held (set_input_source), so never enter
+    _ddc_session from inside this one.
+    """
+    with _named_mutex(
+        _state_lock,
+        _state_mutex,
+        _STATE_WAIT_MS,
+        "Timed out waiting for another process to update the switcher state",
+    ):
+        yield
 
 INPUT_SOURCE_NAMES: dict[int, str] = {
     0x01: "VGA",
@@ -91,22 +126,38 @@ dxva2.DestroyPhysicalMonitors.argtypes = [
     wintypes.DWORD,
     ctypes.POINTER(PHYSICAL_MONITOR),
 ]
+# wintypes.BYTE is signed; the Win32 BYTE VCP code is unsigned.
 dxva2.GetVCPFeatureAndVCPFeatureReply.restype = wintypes.BOOL
 dxva2.GetVCPFeatureAndVCPFeatureReply.argtypes = [
     wintypes.HANDLE,
-    wintypes.BYTE,
-    ctypes.c_void_p,
+    ctypes.c_ubyte,
+    wintypes.LPDWORD,
     wintypes.LPDWORD,
     wintypes.LPDWORD,
 ]
 dxva2.SetVCPFeature.restype = wintypes.BOOL
 dxva2.SetVCPFeature.argtypes = [
     wintypes.HANDLE,
-    wintypes.BYTE,
+    ctypes.c_ubyte,
     wintypes.DWORD,
 ]
+
+MONITORENUMPROC = ctypes.WINFUNCTYPE(
+    wintypes.BOOL,
+    wintypes.HMONITOR,
+    wintypes.HDC,
+    wintypes.LPRECT,
+    wintypes.LPARAM,
+)
 user32.GetMonitorInfoW.restype = wintypes.BOOL
+user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFOEXW)]
 user32.EnumDisplayMonitors.restype = wintypes.BOOL
+user32.EnumDisplayMonitors.argtypes = [
+    wintypes.HDC,
+    wintypes.LPRECT,
+    MONITORENUMPROC,
+    wintypes.LPARAM,
+]
 
 
 @dataclass
@@ -216,7 +267,7 @@ def _get_vcp_input(handle) -> int | None:
     vcp_type = wintypes.DWORD()
     ok = dxva2.GetVCPFeatureAndVCPFeatureReply(
         handle,
-        wintypes.BYTE(VCP_INPUT_SELECT),
+        VCP_INPUT_SELECT,
         ctypes.byref(vcp_type),
         ctypes.byref(current),
         ctypes.byref(maximum),
@@ -231,8 +282,8 @@ def _set_vcp_input(handle, value: int) -> bool:
     return bool(
         dxva2.SetVCPFeature(
             handle,
-            wintypes.BYTE(VCP_INPUT_SELECT),
-            wintypes.DWORD(value),
+            VCP_INPUT_SELECT,
+            value,
         )
     )
 
@@ -364,23 +415,74 @@ def _state_path():
     return Path(__file__).with_name(".switcher_state.json")
 
 
-def _load_state() -> dict:
-    import json
+def _load_state(for_write: bool = False) -> dict:
+    """Read the state file, retrying transient sharing and parse failures.
 
+    With for_write, an unreadable file raises instead of returning {} so the
+    caller cannot overwrite it; a file that stays unparseable is moved aside
+    to ``*.corrupt`` before starting fresh.
+    """
     path = _state_path()
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+    for delay in (*_STATE_READ_DELAYS, None):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            if delay is None:
+                if for_write:
+                    raise
+                return {}
+            time.sleep(delay)
+            continue
+        try:
+            data = json.loads(text)
+        except ValueError:
+            if delay is None:
+                if for_write:
+                    with suppress(OSError):
+                        os.replace(path, path.with_name(path.name + ".corrupt"))
+                return {}
+            time.sleep(delay)
+            continue
         return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return {}
 
 
 def _save_state(data: dict) -> None:
-    import json
+    path = _state_path()
+    payload = json.dumps(data, indent=2) + "\n"
+    with _state_session():
+        fd, tmp_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f"{path.name}.", suffix=".tmp"
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Windows refuses the replace while another process has the target open.
+            for delay in (*_STATE_REPLACE_DELAYS, None):
+                try:
+                    os.replace(tmp_path, path)
+                    break
+                except PermissionError:
+                    if delay is None:
+                        raise
+                    time.sleep(delay)
+        finally:
+            with suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
 
-    _state_path().write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+@contextmanager
+def _edit_state():
+    """Yield the state dict for in-place edits; saved atomically on clean exit."""
+    with _state_session():
+        data = _load_state(for_write=True)
+        yield data
+        _save_state(data)
 
 
 def read_active_pc(group_id: str = "default") -> str:
@@ -391,10 +493,9 @@ def read_active_pc(group_id: str = "default") -> str:
 
 
 def write_active_pc(active: str, group_id: str = "default") -> None:
-    data = _load_state()
-    pc_groups = data.setdefault("pc_groups", {})
-    pc_groups[group_id] = "b" if active == "b" else "a"
-    _save_state(data)
+    with _edit_state() as data:
+        pc_groups = data.setdefault("pc_groups", {})
+        pc_groups[group_id] = "b" if active == "b" else "a"
 
 
 def toggle_pc_group(
@@ -442,6 +543,14 @@ def toggle_pc_group(
         "press retries the same target."
     )
     return target_name, lines
+
+
+def pc_switch_headline(target_name: str, lines: list[str]) -> tuple[bool, str]:
+    """``(ok, message)`` for a ``toggle_pc_group`` result."""
+    last = lines[-1] if lines else ""
+    if last.startswith(("Partial switch", "Could not switch")):
+        return False, last
+    return True, f"Switched to {target_name}"
 
 
 def toggle_input(
@@ -495,10 +604,9 @@ def read_last_input(state_key: str) -> int | None:
 
 
 def _write_last_input(state_key: str, value: int) -> None:
-    data = _load_state()
-    monitor_inputs = data.setdefault("monitor_inputs", {})
-    monitor_inputs[state_key] = value
-    _save_state(data)
+    with _edit_state() as data:
+        monitor_inputs = data.setdefault("monitor_inputs", {})
+        monitor_inputs[state_key] = value
 
 
 def _position_name(index: int, total: int) -> str:
@@ -514,14 +622,10 @@ def _position_name(index: int, total: int) -> str:
 def enumerate_monitors(controllable_only: bool = False) -> list[MonitorInfo]:
     entries: list[tuple[MONITORINFOEXW, int]] = []
 
-    @ctypes.WINFUNCTYPE(
-        wintypes.BOOL,
-        wintypes.HMONITOR,
-        wintypes.HDC,
-        ctypes.POINTER(wintypes.RECT),
-        wintypes.LPARAM,
-    )
+    @MONITORENUMPROC
     def callback(hmonitor, _hdc, _rect, _lparam):
+        if not hmonitor:
+            return True
         info = MONITORINFOEXW()
         info.cbSize = ctypes.sizeof(MONITORINFOEXW)
         if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
@@ -530,7 +634,7 @@ def enumerate_monitors(controllable_only: bool = False) -> list[MonitorInfo]:
         return True
 
     if not user32.EnumDisplayMonitors(None, None, callback, 0):
-        raise OSError("EnumDisplayMonitors failed")
+        raise OSError(ctypes.get_last_error(), "EnumDisplayMonitors failed")
 
     entries.sort(key=lambda item: (item[0].rcMonitor.left, item[0].rcMonitor.top))
     total = len(entries)
@@ -538,7 +642,8 @@ def enumerate_monitors(controllable_only: bool = False) -> list[MonitorInfo]:
 
     for index, (info, hmonitor) in enumerate(entries):
         rect = info.rcMonitor
-        description, controllable, current = _read_from_hmonitor(hmonitor)
+        with _ddc_session():
+            description, controllable, current = _read_from_hmonitor(hmonitor)
         monitor = MonitorInfo(
             index=index,
             position=_position_name(index, total),
