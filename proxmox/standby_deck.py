@@ -17,6 +17,7 @@ import json
 import os
 import select
 import socket
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -158,17 +159,48 @@ def write_image(fd: int, index: int, image: bytes) -> None:
         page += 1
 
 
+def lan_broadcasts(extra: str) -> list[str]:
+    """Every address that can carry a magic packet on this host.
+
+    A /22 LAN's directed broadcast is not 192.168.68.255. Limited
+    broadcast and each interface's real broadcast both need a copy.
+    """
+    found = ["255.255.255.255"]
+    extra = str(extra or "").strip()
+    if extra and extra not in found:
+        found.append(extra)
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "-o", "addr", "show"],
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return found
+    for line in out.splitlines():
+        parts = line.split()
+        if "brd" not in parts:
+            continue
+        brd = parts[parts.index("brd") + 1]
+        if brd and brd != "0.0.0.0" and brd not in found:
+            found.append(brd)
+    return found
+
+
 def send_wol(mac: str, broadcast: str) -> None:
     raw = mac.replace(":", "").replace("-", "")
     if len(raw) != 12:
         raise ValueError("wake address is missing")
     mac_bytes = bytes.fromhex(raw)
     packet = b"\xff" * 6 + mac_bytes * 16
+    targets = lan_broadcasts(broadcast)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        for port in (9, 7):
-            sock.sendto(packet, (broadcast, port))
+        for _ in range(3):
+            for address in targets:
+                for port in (9, 7):
+                    sock.sendto(packet, (address, port))
     finally:
         sock.close()
 
