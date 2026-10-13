@@ -28,6 +28,7 @@ from ddc_monitor import (  # noqa: E402
     enumerate_monitors,
     input_name,
     parse_input_value,
+    pc_switch_headline,
     read_active_pc,
     read_last_input,
     resolve_monitor,
@@ -232,6 +233,10 @@ class Plugin:
         self._progress_contexts: set[str] = set()
         self._progress_imaged: set[str] = set()
         self._progress_state: dict[str, int] = {}
+        # Keys with a press queued or running. Another press on the same key
+        # before that finishes is dropped.
+        self._queued: set[str] = set()
+        self._queued_lock = threading.Lock()
 
     # -- lifecycle -------------------------------------------------------- #
 
@@ -255,6 +260,11 @@ class Plugin:
         if event == "keyDown":
             if context:
                 self._remember_key(context, action, payload)
+                with self._queued_lock:
+                    if context in self._queued:
+                        log("Ignored repeat press while that key is still switching")
+                        return
+                    self._queued.add(context)
                 self.jobs.put((context, payload.get("settings") or {}))
             return
 
@@ -344,15 +354,24 @@ class Plugin:
         return state, f"{label}\n{input_name(last)}"
 
     def refresh_context(self, context: str) -> None:
-        with self._paint_lock:
-            self._refresh_context_body(context)
-
-    def _refresh_context_body(self, context: str) -> None:
+        # The view can shell out to m1ddc, so it is built outside the paint
+        # lock. The timer check is repeated under the lock before painting.
         entry = self.contexts.get(context)
-        if not entry:
+        if not entry or context in self._progress_contexts:
             return
-        if context in self._progress_contexts:
-            return
+        state, title = self._view_for(entry)
+        action = entry.get("action") or ACTION_INPUT
+        image = image_for(action, state)
+        signature = f"{state}|{title}|{image}"
+        with self._paint_lock:
+            if context in self._progress_contexts or context not in self.contexts:
+                return
+            if self.signatures.get(context) == signature:
+                return
+            self.signatures[context] = signature
+            self._send_key_face(context, state, title, action)
+
+    def _view_for(self, entry: dict) -> tuple[int, str]:
         try:
             if entry["action"] == ACTION_PC_SWITCH:
                 state, title = self._pc_switch_view()
@@ -365,14 +384,7 @@ class Plugin:
         except (DDCError, OSError, ValueError) as exc:
             state, title = 0, "Error"
             log(f"Refresh failed: {exc}")
-
-        action = entry.get("action") or ACTION_INPUT
-        image = image_for(action, state)
-        signature = f"{state}|{title}|{image}"
-        if self.signatures.get(context) == signature:
-            return
-        self.signatures[context] = signature
-        self._send_key_face(context, state, title, action)
+        return state, title
 
     def refresh_all(self) -> None:
         for context in list(self.contexts):
@@ -390,32 +402,32 @@ class Plugin:
         with self._paint_lock:
             progress = read_progress()
             if not progress:
-                self._clear_progress_faces()
-                return
-            contexts = self._contexts_for_progress(progress)
-            title = switch_title(
-                str(progress.get("target") or ""),
-                int(progress.get("elapsed") or 0),
-            )
-            seen = set(contexts)
-            stale = [item for item in self._progress_contexts if item not in seen]
-            self._progress_contexts = seen
-            for context in stale:
-                self._forget_progress_face(context)
-                self._refresh_context_body(context)
-            for context in contexts:
-                self._paint_progress_key(context, title)
+                stale = self._clear_progress_faces()
+            else:
+                contexts = self._contexts_for_progress(progress)
+                title = switch_title(
+                    str(progress.get("target") or ""),
+                    int(progress.get("elapsed") or 0),
+                )
+                seen = set(contexts)
+                stale = [item for item in self._progress_contexts if item not in seen]
+                self._progress_contexts = seen
+                for context in stale:
+                    self._forget_progress_face(context)
+                for context in contexts:
+                    self._paint_progress_key(context, title)
+        for context in stale:
+            self.refresh_context(context)
 
-    def _clear_progress_faces(self) -> None:
-        if not self._progress_contexts:
-            return
+    def _clear_progress_faces(self) -> list[str]:
+        """Drop every timer face. Returns the keys that need a settled face."""
         stale = list(self._progress_contexts)
         self._progress_contexts = set()
         self._progress_imaged.clear()
         self._progress_state.clear()
         for context in stale:
             self.signatures.pop(context, None)
-            self._refresh_context_body(context)
+        return stale
 
     def _forget_progress_face(self, context: str) -> None:
         self._progress_imaged.discard(context)
@@ -501,6 +513,9 @@ class Plugin:
         binding = find_binding(config, settings.get("target", ""))
         if binding is None:
             return ""
+        pc_switch = config.get("pc_switch", {}) or {}
+        name_a = str(pc_switch.get("pc_a_name") or "Mac")
+        name_b = str(pc_switch.get("pc_b_name") or "PC")
         state_key = binding.get("device") or ""
         last = read_last_input(state_key) if state_key else None
         try:
@@ -509,8 +524,8 @@ class Plugin:
             input_a = None
         # toggle_input moves A -> B, B -> A, and an unknown input to B.
         if last is None or (input_a is not None and last == input_a):
-            return "PC"
-        return "Mac"
+            return name_b
+        return name_a
 
     def _finish_progress(self, token: str) -> None:
         end_progress(token)
@@ -526,46 +541,60 @@ class Plugin:
     # -- switching -------------------------------------------------------- #
 
     def _worker_loop(self) -> None:
+        # One worker thread, so this plugin never runs two switches at once.
         while not self._stop.is_set():
             try:
                 context, settings = self.jobs.get(timeout=0.25)
             except queue.Empty:
                 continue
-            entry = self.contexts.get(context)
-            if not entry:
-                continue
-            action = entry.get("action")
-            settings = settings or entry.get("settings") or {}
-            token = ""
-            if action in (ACTION_PC_SWITCH, ACTION_DECK, ACTION_INPUT):
-                try:
-                    token = self._start_progress(context, action, settings)
-                except Exception as exc:
-                    log(f"Switch timer failed: {exc}")
             try:
-                if action == ACTION_PC_SWITCH:
-                    self._do_pc_switch()
-                elif action == ACTION_DECK:
-                    self._do_deck_switch()
-                elif action == ACTION_WAKE:
-                    self._do_wake(settings)
-                else:
-                    self._do_input_toggle(settings)
-                self.client.send("showOk", context=context)
-            except Exception as exc:
-                log(f"Switch failed: {exc}")
-                self.client.send("showAlert", context=context)
+                ran = self._run_job(context, settings)
             finally:
-                if token:
-                    try:
-                        self._finish_progress(token)
-                    except Exception as exc:
-                        log(f"Switch timer failed: {exc}")
+                with self._queued_lock:
+                    self._queued.discard(context)
+            if not ran:
+                continue
+            try:
                 self.monitors.invalidate()
                 with self._paint_lock:
                     if context not in self._progress_contexts:
                         self.signatures.pop(context, None)
                 self.refresh_all()
+            except Exception as exc:  # keep the worker alive no matter what
+                log(f"Refresh after switch failed: {exc}")
+
+    def _run_job(self, context: str, settings: dict) -> bool:
+        entry = self.contexts.get(context)
+        if not entry:
+            return False
+        action = entry.get("action")
+        settings = settings or entry.get("settings") or {}
+        token = ""
+        if action in (ACTION_PC_SWITCH, ACTION_DECK, ACTION_INPUT):
+            try:
+                token = self._start_progress(context, action, settings)
+            except Exception as exc:
+                log(f"Switch timer failed: {exc}")
+        try:
+            if action == ACTION_PC_SWITCH:
+                self._do_pc_switch()
+            elif action == ACTION_DECK:
+                self._do_deck_switch()
+            elif action == ACTION_WAKE:
+                self._do_wake(settings)
+            else:
+                self._do_input_toggle(settings)
+            self.client.send("showOk", context=context)
+        except Exception as exc:
+            log(f"Switch failed: {exc}")
+            self.client.send("showAlert", context=context)
+        finally:
+            if token:
+                try:
+                    self._finish_progress(token)
+                except Exception as exc:
+                    log(f"Switch timer failed: {exc}")
+        return True
 
     def _remember_key(self, context: str | None, action: str | None, payload: dict) -> None:
         if not context:
@@ -676,6 +705,9 @@ class Plugin:
         log(f"PC switch -> {target_name}")
         for line in lines:
             log("  " + line)
+        ok, headline = pc_switch_headline(target_name, lines)
+        if not ok:
+            raise ValueError(headline)
 
     def _do_input_toggle(self, settings: dict) -> None:
         config = load_config()
