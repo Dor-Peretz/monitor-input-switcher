@@ -11,6 +11,7 @@ for global hotkeys to fire.
 
 from __future__ import annotations
 
+import functools
 import queue
 import sys
 import threading
@@ -27,6 +28,7 @@ from ddc_monitor import (
     find_monitor,
     input_name,
     parse_input_value,
+    pc_switch_headline,
     resolve_monitor,
     toggle_input,
     toggle_pc_group,
@@ -239,8 +241,14 @@ def _key_token(key_part: str, hotkey: str) -> str:
 
 
 def build_registered_hotkeys(
-    config: dict, monitors: list[MonitorInfo]
+    config: dict, monitors: list[MonitorInfo] | None = None
 ) -> list[RegisteredHotkey]:
+    """Build hotkey actions from config.
+
+    With ``monitors``, bindings whose monitor is not connected are skipped.
+    With ``None``, every binding that names a monitor is kept; each action
+    resolves its monitor when it fires.
+    """
     registered: list[RegisteredHotkey] = []
 
     for binding in config.get("monitor_bindings", []):
@@ -249,7 +257,10 @@ def build_registered_hotkeys(
         hotkey = binding.get("hotkey", "").strip()
         if not hotkey:
             continue
-        if resolve_monitor(monitors, binding) is None:
+        if monitors is None:
+            if not (binding.get("device") or binding.get("monitor") or "").strip():
+                continue
+        elif resolve_monitor(monitors, binding) is None:
             continue
 
         try:
@@ -319,7 +330,8 @@ def build_registered_hotkeys(
                 target_name, lines = toggle_pc_group(
                     live_monitors, monitor_entries, name_a, name_b
                 )
-                return [f"Switched to {target_name}"] + lines
+                _ok, headline = pc_switch_headline(target_name, lines)
+                return [headline] + lines
 
             registered.append(
                 RegisteredHotkey(
@@ -335,32 +347,93 @@ def build_registered_hotkeys(
     return registered
 
 
-def _progress_module():
-    lib = (
-        Path(__file__).resolve().parent
-        / "streamdeck"
-        / "com.dorperetz.monitorswitcher.sdPlugin"
-    )
-    folder = str(lib)
-    if folder not in sys.path:
-        sys.path.insert(0, folder)
-    import switch_progress
+# --------------------------------------------------------------------------- #
+# Switch progress timer (shared with the Stream Deck plugin)
+#
+# switch_progress lives in the plugin folder, which may be missing from an
+# install. These wrappers never raise: without the module (or on any error)
+# the timer is simply not shown and the switch itself still runs.
+# --------------------------------------------------------------------------- #
 
+IDLE_TITLE = "\u21c6"
+
+_PLUGIN_DIR = (
+    Path(__file__).resolve().parent
+    / "streamdeck"
+    / "com.dorperetz.monitorswitcher.sdPlugin"
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _progress_module():
+    folder = str(_PLUGIN_DIR)
+    if folder not in sys.path:
+        sys.path.append(folder)
+    try:
+        import switch_progress
+    except Exception:
+        return None
     return switch_progress
 
 
-def _begin_hotkey_progress(kind: str) -> str:
+def begin_progress(target: str, kind: str) -> str:
+    module = _progress_module()
+    if module is None:
+        return ""
     try:
-        return _progress_module().begin_hotkey_progress(kind)
+        return module.begin_progress(target, kind)
     except Exception:
         return ""
 
 
-def _end_hotkey_progress(token: str) -> None:
+def begin_hotkey_progress(kind: str) -> str:
+    module = _progress_module()
+    if module is None:
+        return ""
     try:
-        _progress_module().end_progress(token)
+        return module.begin_hotkey_progress(kind)
+    except Exception:
+        return ""
+
+
+def end_progress(token: str) -> None:
+    module = _progress_module()
+    if module is None or not token:
+        return
+    try:
+        module.end_progress(token)
     except Exception:
         pass
+
+
+def read_progress() -> dict | None:
+    module = _progress_module()
+    if module is None:
+        return None
+    try:
+        return module.read_progress()
+    except Exception:
+        return None
+
+
+def menu_title(target: str, elapsed: int) -> str:
+    module = _progress_module()
+    if module is None:
+        return IDLE_TITLE
+    try:
+        return module.menu_title(target, elapsed)
+    except Exception:
+        return IDLE_TITLE
+
+
+def other_pc_name() -> str:
+    module = _progress_module()
+    if module is None:
+        return ""
+    try:
+        return module.other_pc_name()
+    except Exception:
+        return ""
 
 
 class HotkeyService:
@@ -400,6 +473,7 @@ class HotkeyService:
             self._error_queue.put("No enabled hotkey bindings found.")
             return
 
+        jobs: queue.Queue[HotkeyAction] = queue.Queue()
         specs: list[tuple[frozenset[str], str, Callable[[], None]]] = []
         for item in registered:
             try:
@@ -407,19 +481,21 @@ class HotkeyService:
             except ValueError as exc:
                 self._error_queue.put(str(exc))
                 continue
-            specs.append((mods, key, self._make_handler(item.action)))
+            specs.append((mods, key, self._make_handler(item.action, jobs)))
 
         if not specs:
             self._error_queue.put("No valid hotkeys to register.")
             return
 
-        # Bind a fresh stop event to this worker so that if a previous worker
-        # is still finishing a slow switch (past stop()'s join timeout) it can
-        # never be revived by a subsequent start().
+        # Bind a fresh stop event and job queue to this worker so that if a
+        # previous worker is still finishing a slow switch (past stop()'s join
+        # timeout) it can never be revived by, or take jobs from, a later
+        # start().
         stop_event = threading.Event()
+        self._job_queue = jobs
         self._worker_stop = stop_event
         self._worker = threading.Thread(
-            target=self._worker_loop, args=(stop_event,), daemon=True
+            target=self._worker_loop, args=(stop_event, jobs), daemon=True
         )
         self._worker.start()
 
@@ -449,6 +525,7 @@ class HotkeyService:
             except Exception:
                 pass
         self._listener = None
+        _drain(self._job_queue)
         if self._worker is not None and self._worker.is_alive():
             self._worker.join(timeout=1.0)
         self._worker = None
@@ -473,30 +550,51 @@ class HotkeyService:
                 break
         return errors
 
-    def _make_handler(self, action: HotkeyAction) -> Callable[[], None]:
+    def _make_handler(
+        self, action: HotkeyAction, jobs: queue.Queue[HotkeyAction]
+    ) -> Callable[[], None]:
         # Keep the pynput event-tap callback near-instant: just enqueue the
         # action. Blocking DDC subprocess work runs on the worker thread so a
         # slow switch can't trip the CGEventTap timeout and drop hotkeys.
         def handler() -> None:
-            self._job_queue.put(action)
+            jobs.put(action)
 
         return handler
 
-    def _worker_loop(self, stop_event: threading.Event) -> None:
-        while not stop_event.is_set():
-            try:
-                action = self._job_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            token = _begin_hotkey_progress(action.kind)
-            try:
-                lines = action.callback()
-                self._event_queue.put(lines)
-            except Exception as exc:
-                self._event_queue.put([f"Error: {exc}"])
-            finally:
-                if token:
-                    _end_hotkey_progress(token)
+    def _worker_loop(
+        self, stop_event: threading.Event, jobs: queue.Queue[HotkeyAction]
+    ) -> None:
+        run_hotkey_jobs(stop_event, jobs, self._event_queue)
+
+
+def _drain(jobs: queue.Queue) -> None:
+    while True:
+        try:
+            jobs.get_nowait()
+        except queue.Empty:
+            return
+
+
+def run_hotkey_jobs(
+    stop_event: threading.Event,
+    jobs: queue.Queue[HotkeyAction],
+    events: queue.Queue[list[str]],
+) -> None:
+    """Worker loop: run queued hotkey actions until ``stop_event`` is set."""
+    while not stop_event.is_set():
+        try:
+            action = jobs.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if stop_event.is_set():
+            return
+        token = begin_hotkey_progress(action.kind)
+        try:
+            events.put(action.callback())
+        except Exception as exc:
+            events.put([f"Error: {exc}"])
+        finally:
+            end_progress(token)
 
 
 def run_toggle_cli(

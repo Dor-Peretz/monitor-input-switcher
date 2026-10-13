@@ -14,12 +14,18 @@ falling back to a sensible default when no state exists.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import platform
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +35,10 @@ from pathlib import Path
 _COMMON_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin")
 
 VCP_INPUT_SELECT = 0x60
+_SET_DELAYS = (0.08, 0.16, 0.28, 0.45, 0.7)
+_MULTI_MONITOR_GAP = 0.22
+_DDC_LOCK_TIMEOUT = 8.0
+_STATE_READ_DELAYS = (0.05, 0.1, 0.2)
 
 # Standard DDC/CI VCP 0x60 input source values (same as the Windows build).
 INPUT_SOURCE_NAMES: dict[int, str] = {
@@ -47,6 +57,10 @@ _BUILTIN_HINTS = ("built-in", "builtin", "color lcd", "retina display", "liquid 
 
 class DDCError(RuntimeError):
     """Raised when the underlying DDC CLI is missing or fails."""
+
+
+class _DDCTimeout(DDCError):
+    """The DDC CLI hung; retrying would only multiply the wait."""
 
 
 @dataclass
@@ -178,6 +192,8 @@ def _run(cmd: list[str], check: bool = True) -> str:
             timeout=15,
             check=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise _DDCTimeout(f"{Path(cmd[0]).name} timed out after {exc.timeout}s") from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise DDCError(f"Failed to run {cmd[0]}: {exc}") from exc
     if check and result.returncode != 0:
@@ -372,6 +388,45 @@ def resolve_monitor(monitors: list[MonitorInfo], entry: dict) -> MonitorInfo | N
 # --------------------------------------------------------------------------- #
 
 
+_ddc_thread_lock = threading.RLock()
+_ddc_depth = 0
+
+
+@contextmanager
+def _ddc_session():
+    """Serialize DDC/CI across threads and between the app's processes."""
+    global _ddc_depth
+    with _ddc_thread_lock:
+        if _ddc_depth:
+            # flock is per open file, so a nested acquire would self-deadlock.
+            _ddc_depth += 1
+            try:
+                yield
+            finally:
+                _ddc_depth -= 1
+            return
+
+        lock_path = _state_path().with_name(".switcher_ddc.lock")
+        with open(lock_path, "a", encoding="utf-8") as handle:
+            deadline = time.monotonic() + _DDC_LOCK_TIMEOUT
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise DDCError(
+                            "Timed out waiting for another switch to finish"
+                        ) from None
+                    time.sleep(0.05)
+            _ddc_depth = 1
+            try:
+                yield
+            finally:
+                _ddc_depth = 0
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def get_input_source(handle: int) -> int | None:  # noqa: ARG001
     # DDC read of the input source is not available on macOS CLIs.
     return None
@@ -384,23 +439,61 @@ def set_input_source(handle: int, value: int, state_key: str | None = None) -> N
             f"'{backend.tool_name}' is not installed. Install it with: "
             f"{backend.install_hint}"
         )
-    backend.set_input(handle, value)
-    _write_last_input(state_key or str(handle), value)
+    last_error: DDCError | None = None
+    with _ddc_session():
+        for attempt, delay in enumerate(_SET_DELAYS, start=1):
+            try:
+                backend.set_input(handle, value)
+            except _DDCTimeout:
+                raise
+            except DDCError as exc:
+                last_error = exc
+                if attempt < len(_SET_DELAYS):
+                    time.sleep(delay)
+                continue
+            _write_last_input(state_key or str(handle), value)
+            return
+    raise DDCError(
+        f"Setting input failed after {len(_SET_DELAYS)} attempts "
+        f"(display {handle}): {last_error}"
+    )
+
+
+def _switch_monitors(
+    assignments: list[tuple[MonitorInfo, int]],
+) -> tuple[list[str], int, int]:
+    """Set explicit inputs on multiple monitors.
+
+    Returns (status lines, successes, failures).
+    """
+    lines: list[str] = []
+    successes = 0
+    failures = 0
+    with _ddc_session():
+        for index, (monitor, target) in enumerate(assignments):
+            if index:
+                time.sleep(_MULTI_MONITOR_GAP)
+            if not monitor.controllable or monitor.handle is None:
+                lines.append(f"[{monitor.position}] skipped (not controllable)")
+                failures += 1
+                continue
+            try:
+                set_input_source(monitor.handle, target, monitor.device_name)
+                successes += 1
+                lines.append(
+                    f"[{monitor.position}] {monitor.description} -> {input_name(target)}"
+                )
+            except (DDCError, OSError) as exc:
+                failures += 1
+                lines.append(f"[{monitor.position}] failed: {exc}")
+    return lines, successes, failures
 
 
 def switch_monitors_to_inputs(
     monitors: list[MonitorInfo],
     assignments: list[tuple[MonitorInfo, int]],
 ) -> list[str]:
-    lines: list[str] = []
-    for monitor, target in assignments:
-        if not monitor.controllable or monitor.handle is None:
-            lines.append(f"[{monitor.position}] skipped (not controllable)")
-            continue
-        set_input_source(monitor.handle, target, monitor.device_name)
-        lines.append(
-            f"[{monitor.position}] {monitor.description} -> {input_name(target)}"
-        )
+    lines, _ok, _fail = _switch_monitors(assignments)
     return lines
 
 
@@ -445,16 +538,17 @@ def toggle_input(
     last value we wrote (persisted state).
     """
     key = state_key or str(handle)
-    last = _read_last_input(key)
+    with _ddc_session():
+        last = _read_last_input(key)
 
-    if last == input_a:
-        target = input_b
-    elif last == input_b:
-        target = input_a
-    else:
-        target = input_b
+        if last == input_a:
+            target = input_b
+        elif last == input_b:
+            target = input_a
+        else:
+            target = input_b
 
-    set_input_source(handle, target, state_key=key)
+        set_input_source(handle, target, state_key=key)
     previous = last if last is not None else -1
     return previous, target
 
@@ -468,19 +562,70 @@ def _state_path() -> Path:
     return Path(__file__).with_name(".switcher_state.json")
 
 
-def _load_state() -> dict:
+def _load_state(for_update: bool = False) -> dict:
+    """Read the state file; only a missing file counts as empty state.
+
+    With ``for_update`` (caller holds ``_state_lock``) read errors propagate,
+    and a file that stays unparseable is moved aside instead of being
+    silently overwritten.
+    """
     path = _state_path()
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+    for delay in (*_STATE_READ_DELAYS, None):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            if for_update:
+                raise
+            return {}
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            if delay is None:
+                break
+            time.sleep(delay)
+            continue
         return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+
+    if for_update:
+        os.replace(path, path.with_name(path.name + ".corrupt"))
+    return {}
 
 
 def _save_state(data: dict) -> None:
-    _state_path().write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    path = _state_path()
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(data, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+@contextmanager
+def _state_lock():
+    path = _state_path()
+    with open(path.with_name(path.name + ".lock"), "a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _state_section(data: dict, key: str) -> dict:
+    section = data.get(key)
+    if not isinstance(section, dict):
+        section = data[key] = {}
+    return section
 
 
 def _read_last_input(state_key: str) -> int | None:
@@ -495,10 +640,10 @@ def _read_last_input(state_key: str) -> int | None:
 
 
 def _write_last_input(state_key: str, value: int) -> None:
-    data = _load_state()
-    monitor_inputs = data.setdefault("monitor_inputs", {})
-    monitor_inputs[state_key] = value
-    _save_state(data)
+    with _state_lock():
+        data = _load_state(for_update=True)
+        _state_section(data, "monitor_inputs")[state_key] = value
+        _save_state(data)
 
 
 def read_last_input(state_key: str) -> int | None:
@@ -509,15 +654,15 @@ def read_last_input(state_key: str) -> int | None:
 def read_active_pc(group_id: str = "default") -> str:
     data = _load_state()
     pc_groups = data.get("pc_groups", {})
-    active = pc_groups.get(group_id, "a")
+    active = pc_groups.get(group_id, "a") if isinstance(pc_groups, dict) else "a"
     return "b" if active == "b" else "a"
 
 
 def write_active_pc(active: str, group_id: str = "default") -> None:
-    data = _load_state()
-    pc_groups = data.setdefault("pc_groups", {})
-    pc_groups[group_id] = "b" if active == "b" else "a"
-    _save_state(data)
+    with _state_lock():
+        data = _load_state(for_update=True)
+        _state_section(data, "pc_groups")[group_id] = "b" if active == "b" else "a"
+        _save_state(data)
 
 
 def toggle_pc_group(
@@ -527,29 +672,58 @@ def toggle_pc_group(
     pc_b_name: str,
     group_id: str = "default",
 ) -> tuple[str, list[str]]:
-    active = read_active_pc(group_id)
-    target_pc = "b" if active == "a" else "a"
-    target_name = pc_b_name if target_pc == "b" else pc_a_name
-    input_key = "input_b" if target_pc == "b" else "input_a"
+    """Toggle all configured monitors between PC A and PC B inputs."""
+    with _ddc_session():
+        active = read_active_pc(group_id)
+        target_pc = "b" if active == "a" else "a"
+        target_name = pc_b_name if target_pc == "b" else pc_a_name
+        input_key = "input_b" if target_pc == "b" else "input_a"
 
-    assignments: list[tuple[MonitorInfo, int]] = []
-    for entry in monitor_configs:
-        if not entry.get("enabled", True):
-            continue
-        monitor = resolve_monitor(monitors, entry)
-        if monitor is None:
-            continue
-        if entry.get(input_key) is None:
-            continue
-        try:
-            target = parse_input_value(entry[input_key])
-        except (ValueError, TypeError):
-            continue
-        assignments.append((monitor, target))
+        assignments: list[tuple[MonitorInfo, int]] = []
+        problems: list[str] = []
+        for entry in monitor_configs:
+            if not entry.get("enabled", True):
+                continue
+            label = str(entry.get("monitor") or entry.get("device") or "?")
+            monitor = resolve_monitor(monitors, entry)
+            if monitor is None:
+                problems.append(f"[{label}] monitor not found")
+                continue
+            try:
+                target = parse_input_value(entry[input_key])
+            except (KeyError, TypeError, ValueError):
+                problems.append(f"[{label}] missing input code")
+                continue
+            assignments.append((monitor, target))
 
-    lines = switch_monitors_to_inputs(monitors, assignments)
-    write_active_pc(target_pc, group_id)
+        lines, successes, failures = _switch_monitors(assignments)
+        lines.extend(problems)
+        failures += len(problems)
+
+        if successes and not failures:
+            write_active_pc(target_pc, group_id)
+            return target_name, lines
+
+    if successes:
+        lines.append(
+            f"Partial switch to {target_name} ({successes} ok, {failures} failed). "
+            "State was not flipped — press the hotkey again to retry."
+        )
+        return target_name, lines
+
+    lines.append(
+        f"Could not switch to {target_name}. Kept previous PC state so the next "
+        "press retries the same target."
+    )
     return target_name, lines
+
+
+def pc_switch_headline(target_name: str, lines: list[str]) -> tuple[bool, str]:
+    """``(ok, message)`` for a ``toggle_pc_group`` result."""
+    last = lines[-1] if lines else ""
+    if last.startswith(("Partial switch", "Could not switch")):
+        return False, last
+    return True, f"Switched to {target_name}"
 
 
 # --------------------------------------------------------------------------- #

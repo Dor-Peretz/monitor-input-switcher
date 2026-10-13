@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -69,31 +71,46 @@ def is_startup_enabled() -> bool:
 
 
 def enable_startup() -> None:
-    _launch_agents_dir().mkdir(parents=True, exist_ok=True)
-    path = plist_path()
-    path.write_text(_plist_contents(), encoding="utf-8")
-    # Best-effort (re)load; ignore failures (e.g. already loaded).
-    subprocess.run(
-        ["launchctl", "unload", str(path)],
-        capture_output=True,
-        check=False,
+    """Install the LaunchAgent; launchd picks it up at the next login.
+
+    It is deliberately not loaded now: with RunAtLoad, ``launchctl load``
+    would start a second copy of the app alongside the one already running.
+    """
+    directory = _launch_agents_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=directory, prefix=f".{APP_LABEL}.", suffix=".tmp"
     )
-    subprocess.run(
-        ["launchctl", "load", str(path)],
-        capture_output=True,
-        check=False,
-    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o644)
+            handle.write(_plist_contents())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, plist_path())
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def disable_startup() -> None:
-    path = plist_path()
-    if path.exists():
+    plist_path().unlink(missing_ok=True)
+    # launchd sets XPC_SERVICE_NAME to the job label; removing our own job
+    # would SIGTERM this process.
+    if os.environ.get("XPC_SERVICE_NAME") == APP_LABEL:
+        return
+    try:
         subprocess.run(
-            ["launchctl", "unload", str(path)],
+            ["launchctl", "remove", APP_LABEL],
             capture_output=True,
             check=False,
+            timeout=10,
         )
-        path.unlink(missing_ok=True)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:

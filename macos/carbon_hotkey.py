@@ -29,27 +29,15 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import queue
-import sys
 import threading
-from pathlib import Path
-from typing import Callable
 
 from config_store import load_config
-from ddc_monitor import enumerate_monitors
 from hotkey_service import (
     HotkeyAction,
     build_registered_hotkeys,
     parse_hotkey_spec,
+    run_hotkey_jobs,
 )
-
-_PLUGIN_LIB = (
-    Path(__file__).resolve().parent
-    / "streamdeck"
-    / "com.dorperetz.monitorswitcher.sdPlugin"
-)
-if str(_PLUGIN_LIB) not in sys.path:
-    sys.path.insert(0, str(_PLUGIN_LIB))
-from switch_progress import begin_hotkey_progress, end_progress  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Carbon.framework bindings (ctypes)
@@ -63,6 +51,8 @@ _carbon = ctypes.CDLL(_carbon_path)
 OSStatus = ctypes.c_int32
 OSType = ctypes.c_uint32
 UInt32 = ctypes.c_uint32
+ByteCount = ctypes.c_ulong  # unsigned long: 64-bit on macOS
+ItemCount = ctypes.c_ulong
 
 
 class _EventTypeSpec(ctypes.Structure):
@@ -85,7 +75,7 @@ _carbon.InstallEventHandler.restype = OSStatus
 _carbon.InstallEventHandler.argtypes = [
     ctypes.c_void_p,                 # inTarget
     _HANDLER_FUNC,                   # inHandler
-    UInt32,                          # inNumTypes
+    ItemCount,                       # inNumTypes
     ctypes.POINTER(_EventTypeSpec),  # inList
     ctypes.c_void_p,                 # inUserData
     ctypes.c_void_p,                 # outRef (nullable)
@@ -106,13 +96,13 @@ _carbon.UnregisterEventHotKey.argtypes = [ctypes.c_void_p]
 
 _carbon.GetEventParameter.restype = OSStatus
 _carbon.GetEventParameter.argtypes = [
-    ctypes.c_void_p,  # inEvent
-    OSType,           # inName
-    OSType,           # inDesiredType
-    ctypes.c_void_p,  # outActualType (nullable)
-    UInt32,           # inBufferSize
-    ctypes.c_void_p,  # outActualSize (nullable)
-    ctypes.c_void_p,  # outData
+    ctypes.c_void_p,             # inEvent
+    OSType,                      # inName
+    OSType,                      # inDesiredType
+    ctypes.c_void_p,             # outActualType (nullable)
+    ByteCount,                   # inBufferSize
+    ctypes.POINTER(ByteCount),   # outActualSize (nullable)
+    ctypes.c_void_p,             # outData
 ]
 
 
@@ -209,20 +199,11 @@ class CarbonHotKeyManager:
 
     def start(self, config: dict | None = None) -> None:
         self.stop()
-        config = config or load_config()
-
         try:
-            monitors = enumerate_monitors()
-        except Exception as exc:
-            self._error_queue.put(str(exc))
-            return
-
-        if not any(monitor.controllable for monitor in monitors):
-            self._error_queue.put("No controllable DDC/CI monitors detected.")
-            return
-
-        try:
-            registered = build_registered_hotkeys(config, monitors)
+            config = config or load_config()
+            # No monitor scan here (m1ddc can block for seconds on the main
+            # thread); each action resolves its monitors when it fires.
+            registered = build_registered_hotkeys(config)
         except Exception as exc:
             self._error_queue.put(f"Failed to build hotkeys: {exc}")
             return
@@ -230,8 +211,14 @@ class CarbonHotKeyManager:
             self._error_queue.put("No enabled hotkey bindings found.")
             return
 
-        self._ensure_handler_installed()
+        try:
+            self._ensure_handler_installed()
+        except RuntimeError as exc:
+            self._error_queue.put(str(exc))
+            return
 
+        jobs: queue.Queue[HotkeyAction] = queue.Queue()
+        self._job_queue = jobs
         registered_any = False
         for item in registered:
             try:
@@ -251,10 +238,15 @@ class CarbonHotKeyManager:
             self._error_queue.put("No valid hotkeys could be registered.")
             return
 
+        # A fresh stop event and job queue per run: a previous worker still
+        # finishing a slow switch past stop()'s join timeout exits on its own
+        # flag and never runs jobs registered by this config.
         stop_event = threading.Event()
         self._worker_stop = stop_event
         self._worker = threading.Thread(
-            target=self._worker_loop, args=(stop_event,), daemon=True
+            target=run_hotkey_jobs,
+            args=(stop_event, jobs, self._event_queue),
+            daemon=True,
         )
         self._worker.start()
         self._running = True
@@ -269,6 +261,11 @@ class CarbonHotKeyManager:
                 pass
         self._hotkey_refs.clear()
         self._actions.clear()
+        while True:
+            try:
+                self._job_queue.get_nowait()
+            except queue.Empty:
+                break
         if self._worker is not None and self._worker.is_alive():
             self._worker.join(timeout=1.0)
         self._worker = None
@@ -317,16 +314,21 @@ class CarbonHotKeyManager:
         # enqueue its action for the worker thread.
         try:
             hk_id = _EventHotKeyID()
+            actual_size = ByteCount(0)
             status = _carbon.GetEventParameter(
                 event,
                 _K_EVENT_PARAM_DIRECT_OBJECT,
                 _TYPE_EVENT_HOTKEY_ID,
                 None,
                 ctypes.sizeof(hk_id),
-                None,
+                ctypes.byref(actual_size),
                 ctypes.byref(hk_id),
             )
-            if status == 0:
+            if (
+                status == 0
+                and actual_size.value == ctypes.sizeof(hk_id)
+                and hk_id.signature == _SIGNATURE
+            ):
                 action = self._actions.get(hk_id.id)
                 if action is not None:
                     self._job_queue.put(action)
@@ -334,26 +336,7 @@ class CarbonHotKeyManager:
             self._error_queue.put(f"Hotkey dispatch error: {exc}")
         return 0  # noErr
 
-    # -- worker + polling ------------------------------------------------- #
-
-    def _worker_loop(self, stop_event: threading.Event) -> None:
-        while not stop_event.is_set():
-            try:
-                action = self._job_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            token = begin_hotkey_progress(action.kind)
-            try:
-                lines = action.callback()
-                self._event_queue.put(lines)
-            except Exception as exc:
-                self._event_queue.put([f"Error: {exc}"])
-            finally:
-                if token:
-                    try:
-                        end_progress(token)
-                    except Exception:
-                        pass
+    # -- polling ---------------------------------------------------------- #
 
     def poll_events(self) -> list[list[str]]:
         events: list[list[str]] = []

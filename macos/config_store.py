@@ -7,6 +7,8 @@ shared between the two. Only the default hotkeys differ (macOS conventions).
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 
@@ -60,7 +62,10 @@ def load_config(path: Path | None = None) -> dict:
         return deepcopy(DEFAULT_CONFIG)
 
     with path.open(encoding="utf-8") as handle:
-        data = json.load(handle)
+        try:
+            data = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Config file {path} is not valid JSON: {exc}") from exc
 
     return migrate_config(data)
 
@@ -69,12 +74,29 @@ def save_config(data: dict, path: Path | None = None) -> None:
     path = path or config_path()
     data = migrate_config(data)
     data["version"] = CONFIG_VERSION
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
-        handle.write("\n")
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if path.exists():
+                os.fchmod(handle.fileno(), path.stat().st_mode & 0o777)
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def migrate_config(data: dict) -> dict:
+    data = deepcopy(data)
     if data.get("version") == CONFIG_VERSION:
         return _ensure_pc_switch(data)
 
@@ -91,12 +113,14 @@ def migrate_config(data: dict) -> dict:
                     "input_b": binding["inputs"][1],
                 }
             )
-        return {
-            "version": CONFIG_VERSION,
-            "monitor_bindings": monitor_bindings,
-            "pc_switch": deepcopy(DEFAULT_CONFIG["pc_switch"]),
-            "streamdeck_hub": deepcopy(DEFAULT_STREAMDECK_HUB),
-        }
+        return _ensure_pc_switch(
+            {
+                "version": CONFIG_VERSION,
+                "monitor_bindings": monitor_bindings,
+                "pc_switch": deepcopy(DEFAULT_CONFIG["pc_switch"]),
+                "streamdeck_hub": deepcopy(DEFAULT_STREAMDECK_HUB),
+            }
+        )
 
     return _ensure_pc_switch(deepcopy(DEFAULT_CONFIG) | data)
 

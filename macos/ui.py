@@ -3,17 +3,26 @@
 
 from __future__ import annotations
 
+import threading
 import tkinter as tk
+from copy import deepcopy
 from tkinter import messagebox, ttk
 
 from config_store import (
+    CONFIG_VERSION,
     INPUT_CHOICES,
     input_label,
     input_value_from_label,
     load_config,
     save_config,
 )
-from ddc_monitor import DDCError, MonitorInfo, enumerate_monitors, read_active_pc
+from ddc_monitor import (
+    DDCError,
+    MonitorInfo,
+    enumerate_monitors,
+    read_active_pc,
+    resolve_monitor,
+)
 
 # NOTE: Global hotkeys are handled by the menu bar app via native Carbon
 # (carbon_hotkey.CarbonHotKeyManager). This settings window intentionally does
@@ -158,6 +167,7 @@ class MonitorSwitcherUI:
         self.config = load_config()
         self.monitor_rows: list[dict] = []
         self.pc_rows: list[dict] = []
+        self._busy = False
 
         self._build_layout()
         self.refresh_monitors()
@@ -321,19 +331,49 @@ class MonitorSwitcherUI:
         for child in frame.winfo_children():
             child.destroy()
 
+    def _match_saved(self, entries: list[dict]) -> tuple[dict[int, dict], list[dict]]:
+        """Pair saved entries with live monitors (keyed by monitor index).
+
+        Returns the matches plus the entries that match no live monitor.
+        Exact device+position matches are claimed first so two monitors of
+        the same model keep their own entries.
+        """
+        matched: dict[int, dict] = {}
+        pending: list[dict] = []
+        for entry in entries:
+            exact = next(
+                (
+                    m
+                    for m in self.monitors
+                    if m.index not in matched
+                    and m.device_name == entry.get("device")
+                    and m.position == entry.get("monitor")
+                ),
+                None,
+            )
+            if exact is None:
+                pending.append(entry)
+            else:
+                matched[exact.index] = entry
+
+        unmatched: list[dict] = []
+        for entry in pending:
+            free = [m for m in self.monitors if m.index not in matched]
+            monitor = resolve_monitor(free, entry)
+            if monitor is None:
+                unmatched.append(entry)
+            else:
+                matched[monitor.index] = entry
+        return matched, unmatched
+
     def _render_monitor_rows(self, monitors: list[MonitorInfo]) -> None:
         self.monitor_rows = []
         self._clear_frame(self.monitor_rows_frame)
 
-        saved = {
-            (entry.get("device") or entry.get("monitor", "")): entry
-            for entry in self.config.get("monitor_bindings", [])
-        }
+        saved, _unmatched = self._match_saved(self.config.get("monitor_bindings", []))
 
         for monitor in monitors:
-            saved_entry = (
-                saved.get(monitor.device_name) or saved.get(monitor.position, {})
-            )
+            saved_entry = saved.get(monitor.index, {})
             switchable = monitor.controllable
 
             block = ttk.Frame(self.monitor_rows_frame, padding=(0, 8))
@@ -397,15 +437,12 @@ class MonitorSwitcherUI:
         self.pc_rows = []
         self._clear_frame(self.pc_rows_frame)
 
-        saved = {
-            (entry.get("device") or entry.get("monitor", "")): entry
-            for entry in self.config.get("pc_switch", {}).get("monitors", [])
-        }
+        saved, _unmatched = self._match_saved(
+            self.config.get("pc_switch", {}).get("monitors", [])
+        )
 
         for monitor in monitors:
-            saved_entry = (
-                saved.get(monitor.device_name) or saved.get(monitor.position, {})
-            )
+            saved_entry = saved.get(monitor.index, {})
             switchable = monitor.controllable
 
             block = ttk.Frame(self.pc_rows_frame, padding=(0, 8))
@@ -461,7 +498,17 @@ class MonitorSwitcherUI:
         value = input_value_from_label(combo.get())
         return fallback if value is None else value
 
+    def _entries_outside_form(self, entries: list[dict]) -> list[dict]:
+        """Saved entries the form does not edit (monitor absent or not switchable)."""
+        matched, unmatched = self._match_saved(entries)
+        switchable = {m.index for m in self.monitors if m.controllable}
+        keep = {id(entry) for entry in unmatched} | {
+            id(entry) for index, entry in matched.items() if index not in switchable
+        }
+        return [deepcopy(entry) for entry in entries if id(entry) in keep]
+
     def build_config_from_form(self) -> dict:
+        config = deepcopy(self.config)
         monitor_bindings = []
         for row in self.monitor_rows:
             if not row.get("switchable", True):
@@ -495,17 +542,28 @@ class MonitorSwitcherUI:
                 }
             )
 
-        return {
-            "version": 2,
-            "monitor_bindings": monitor_bindings,
-            "pc_switch": {
+        monitor_bindings += self._entries_outside_form(
+            self.config.get("monitor_bindings", [])
+        )
+        pc_monitors += self._entries_outside_form(
+            self.config.get("pc_switch", {}).get("monitors", [])
+        )
+
+        config["version"] = CONFIG_VERSION
+        config["monitor_bindings"] = monitor_bindings
+        pc_switch = config.get("pc_switch")
+        if not isinstance(pc_switch, dict):
+            pc_switch = config["pc_switch"] = {}
+        pc_switch.update(
+            {
                 "enabled": self.pc_enabled.get(),
                 "hotkey": self.pc_hotkey.get().strip(),
                 "pc_a_name": self.pc_a_name.get().strip() or "PC 1",
                 "pc_b_name": self.pc_b_name.get().strip() or "PC 2",
                 "monitors": pc_monitors,
-            },
-        }
+            }
+        )
+        return config
 
     def save(self) -> None:
         try:
@@ -520,37 +578,64 @@ class MonitorSwitcherUI:
 
     def switch_now(self) -> None:
         """Trigger the PC-switch immediately from the current form settings."""
-        from ddc_monitor import toggle_pc_group
+        from ddc_monitor import pc_switch_headline, toggle_pc_group
+
+        if self._busy:
+            self._append_log("Wait \u2014 a switch is already in progress.")
+            return
 
         try:
-            config = self.build_config_from_form()
-            pc = config.get("pc_switch", {})
-            monitor_cfgs = [
-                entry
-                for entry in pc.get("monitors", [])
-                if entry.get("enabled", True)
-            ]
-            if not monitor_cfgs:
-                self._append_log(
-                    "Switch Now: no PC-switch monitors are enabled. "
-                    "Enable monitors in the PC Switch tab first."
-                )
-                return
-            monitors = enumerate_monitors()
-            target_name, lines = toggle_pc_group(
-                monitors,
-                monitor_cfgs,
-                pc.get("pc_a_name", "PC 1"),
-                pc.get("pc_b_name", "PC 2"),
-            )
-            self._append_log(f"Switch Now -> {target_name}")
-            for line in lines:
-                self._append_log("  " + line)
-            self.active_pc_var.set(f"Active PC: {target_name}")
-            self._set_status(f"Switched to {target_name}.")
+            pc = self.build_config_from_form().get("pc_switch", {})
         except Exception as exc:
             self._append_log(f"Switch Now failed: {exc}")
             messagebox.showerror("Switch failed", str(exc))
+            return
+        monitor_cfgs = [
+            entry for entry in pc.get("monitors", []) if entry.get("enabled", True)
+        ]
+        if not monitor_cfgs:
+            self._append_log(
+                "Switch Now: no PC-switch monitors are enabled. "
+                "Enable monitors in the PC Switch tab first."
+            )
+            return
+        pc_a_name = pc.get("pc_a_name", "PC 1")
+        pc_b_name = pc.get("pc_b_name", "PC 2")
+
+        self._busy = True
+        self._set_status("Switching...")
+
+        def runner():
+            error = None
+            target_name, lines = "", []
+            try:
+                target_name, lines = toggle_pc_group(
+                    enumerate_monitors(), monitor_cfgs, pc_a_name, pc_b_name
+                )
+            except Exception as exc:
+                error = exc
+
+            def done():
+                self._busy = False
+                if error is not None:
+                    self._append_log(f"Switch Now failed: {error}")
+                    self._set_status("Switch failed.")
+                    messagebox.showerror("Switch failed", str(error))
+                    return
+                self._append_log(f"Switch Now -> {target_name}")
+                for line in lines:
+                    self._append_log("  " + line)
+                ok, headline = pc_switch_headline(target_name, lines)
+                if ok:
+                    self.active_pc_var.set(f"Active PC: {target_name}")
+                self._set_status(headline)
+
+            try:
+                self.root.after(0, done)
+            except (RuntimeError, tk.TclError):
+                pass  # window closed while switching
+
+        threading.Thread(target=runner, daemon=True).start()
 
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state="normal")
