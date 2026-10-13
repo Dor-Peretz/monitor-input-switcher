@@ -241,11 +241,24 @@ def _find_deck(settings: dict | None = None) -> dict:
     return matches[0]
 
 
+def _clear_auto_use(settings: dict) -> None:
+    """Turn off every VirtualHere auto-use mode on this computer.
+
+    Auto-use all, hub, port and device each grab the deck the moment the
+    standby screen gets it, without restarting Elgato, so the keys go dead.
+    LIST only shows some of them; CLEAR ALL covers all and is not a toggle.
+    """
+    _run_client("AUTO USE CLEAR ALL", settings)
+
+
 def _disable_auto_use(deck: dict, settings: dict) -> dict:
     """Auto-use would grab the deck straight back after we release it."""
+    try:
+        _clear_auto_use(settings)
+    except Exception as exc:
+        _log(f"Could not clear VirtualHere auto-use: {exc}")
     if not deck["auto_use"]:
         return deck
-    _run_client(f"AUTO USE DEVICE,{deck['address']}", settings)
     return _find_deck(settings)
 
 
@@ -1112,12 +1125,20 @@ def _follow_loop() -> None:
     next_discover = 0.0
     claim_delay = 0.0
     next_claim = 0.0
+    auto_use_cleared = False
     while True:
         time.sleep(4)
         try:
             settings = hub_settings()
             if not settings["enabled"]:
                 continue
+            if not auto_use_cleared:
+                try:
+                    _clear_auto_use(settings)
+                    auto_use_cleared = True
+                    _log("Cleared VirtualHere auto-use on this computer.")
+                except Exception as exc:
+                    _log(f"Could not clear VirtualHere auto-use: {exc}")
             try:
                 _watch_elgato(settings)
             except Exception as exc:
