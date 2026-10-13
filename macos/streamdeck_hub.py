@@ -81,6 +81,7 @@ _WATCHDOG_GRACE = 25.0
 _WATCHDOG_RETRY = 30.0
 _WATCHDOG_RESTARTS = 2
 _AUTO_CLAIM_COOLDOWN = 600.0
+_PEER_SEARCH_EVERY = 600.0
 # kIOMessage* from IOKit/pwr_mgt/IOPMLibDefs.h
 _IO_CAN_SLEEP = 0xE0000270
 _IO_WILL_SLEEP = 0xE0000280
@@ -528,15 +529,18 @@ def _state_locked():
 
 
 def resolved_peer_url(settings: dict | None = None) -> str:
-    """Configured peer, or the address the other computer last called from."""
+    """Where the other computer last called from, else the configured peer.
+
+    A configured address goes stale when DHCP moves the other computer; it
+    would then look switched off and this side would take the deck.
+    """
     settings = settings or hub_settings()
-    if settings["peer_url"]:
-        return settings["peer_url"]
-    return str(_read_json(SEEN_PEER_FILE).get("peer_url") or "").rstrip("/")
+    seen = str(_read_json(SEEN_PEER_FILE).get("peer_url") or "").rstrip("/")
+    return seen or settings["peer_url"]
 
 
 def remember_peer_host(host: str) -> None:
-    """The other computer calls us on 8765. Remember it when peer_url is blank."""
+    """The other computer calls us on 8765. Remember where it is now."""
     if not host:
         return
     if host.startswith("::ffff:"):
@@ -546,8 +550,6 @@ def remember_peer_host(host: str) -> None:
     url_host = f"[{host}]" if ":" in host else host
     settings = hub_settings()
     url = f"http://{url_host}:{settings['listen_port']}"
-    if settings["peer_url"]:
-        return
     with _state_locked():
         current = _read_json(SEEN_PEER_FILE).get("peer_url")
         if current == url:
@@ -678,22 +680,23 @@ def _probe_hub(host: str, port: int, timeout: float) -> dict | None:
     return data
 
 
-def discover_peer_url(settings: dict | None = None) -> str:
+def discover_peer_url(settings: dict | None = None, force: bool = False) -> str:
     """Find the other computer on the LAN when peer_url was never set.
 
     The other side is only remembered after it calls us. Pressing Mac / PC on
     this computer has to be able to go first, so an empty address is resolved
     by asking who on the local network answers the hub health check as the
-    other computer.
+    other computer. ``force`` searches even when an address is known, for when
+    that address stopped answering.
     """
     settings = settings or hub_settings()
     known = resolved_peer_url(settings)
-    if known:
+    if known and not force:
         return known
     other = "b" if settings["local_pc"] == "a" else "a"
     with _discover_lock:
         known = resolved_peer_url(settings)
-        if known:
+        if known and not force:
             return known
         hosts = peer_scan_hosts()
         if not hosts:
@@ -1004,6 +1007,7 @@ def elgato_driving() -> bool | None:
 
 _watchdog = {"plugin_seen": False, "since": 0.0, "restarts": 0, "next": 0.0}
 _auto_claim_blocked_until = 0.0
+_peer_search_at = 0.0
 
 
 def _watch_elgato(settings: dict) -> None:
@@ -1046,6 +1050,22 @@ def _watch_elgato(settings: dict) -> None:
     _log(f"Elgato never showed the Stream Deck; gave it back to the standby screen. {note}")
 
 
+def _peer_moved(settings: dict) -> bool:
+    """Search the LAN before deciding a silent peer is off. True when found."""
+    global _peer_search_at
+    now = time.monotonic()
+    if _peer_search_at and now - _peer_search_at < _PEER_SEARCH_EVERY:
+        return False
+    _peer_search_at = now
+    before = resolved_peer_url(settings)
+    found = discover_peer_url(settings, force=True)
+    if not found:
+        return False
+    if found != before:
+        _log(f"The other computer moved from {before} to {found}.")
+    return peer_status(settings) is not None
+
+
 def claim_if_alone() -> str | None:
     """Take the deck when the other computer is off and we do not hold it."""
     if _follow_suspended():
@@ -1061,6 +1081,8 @@ def claim_if_alone() -> str | None:
         return None
     deck = _find_deck(settings)
     if deck["in_use_by_me"]:
+        return None
+    if _peer_moved(settings):
         return None
     note = claim_local()
     write_selected(settings["local_pc"])
