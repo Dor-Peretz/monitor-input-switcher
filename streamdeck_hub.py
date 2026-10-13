@@ -16,8 +16,11 @@ Stream Deck plugin.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import os
@@ -29,6 +32,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,7 +50,26 @@ _started = False
 _start_lock = threading.Lock()
 _client_lock = threading.RLock()
 _suspend_follow = False
+_suspend_follow_until = 0.0
+# A suspend that Windows cancels sends no resume event.
+_SUSPEND_FOLLOW_MAX = 120.0
+# macOS waits up to 30 s for IOAllowPowerChange; Windows gives about 2 s.
+_SLEEP_HANDOFF_WAIT = 25.0 if sys.platform == "darwin" else 5.0
+_CLAIM_BACKOFF_MAX = 60.0
+_restart_threads: list[threading.Thread] = []
 _MAC_ADDRESS = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
+_WINDOWS_MAC = re.compile(
+    r"(?<![0-9A-Fa-f-])(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f-])"
+)
+_CLIENT_TIMEOUT = 20
+_CLAIM_ATTEMPTS = 5
+_CLAIM_RETRY_WINDOW = 30.0
+# A claim attempt makes up to five VirtualHere calls and may first wait for
+# another call to release _client_lock. No attempt starts after the window.
+_PEER_CLAIM_TIMEOUT = _CLAIM_RETRY_WINDOW + 6 * _CLIENT_TIMEOUT + 10
+_PEER_RELEASE_TIMEOUT = 30
+_HANDOFF_SETTLE = 30.0
+_MAX_BODY = 4096
 # kIOMessage* from IOKit/pwr_mgt/IOPMLibDefs.h
 _IO_CAN_SLEEP = 0xE0000270
 _IO_WILL_SLEEP = 0xE0000280
@@ -104,6 +127,7 @@ def hub_settings() -> dict:
         "label_a": str(raw.get("label_a") or "Mac"),
         "label_b": str(raw.get("label_b") or "PC"),
         "follow_power": bool(raw.get("follow_power", True)),
+        "wol_broadcast": str(raw.get("wol_broadcast") or "").strip(),
     }
 
 
@@ -140,6 +164,7 @@ def parse_list(text: str) -> list[dict]:
                 "name": match.group("name").strip(),
                 "address": match.group("address").strip(),
                 "auto_use": bool(match.group(1)),
+                "in_use": "in-use" in rest.lower() or "in use" in rest.lower(),
                 "in_use_by_me": "in-use by you" in rest.lower(),
             }
         )
@@ -168,7 +193,7 @@ def _run_client_locked(binary: str, command: str) -> str:
         reply_path = Path(handle.name)
         argv.extend(["-r", str(reply_path)])
     try:
-        result = _run_hidden(argv, timeout=20)
+        result = _run_hidden(argv, timeout=_CLIENT_TIMEOUT)
         output = ((result.stdout or "") + (result.stderr or "")).strip()
         if reply_path is not None:
             try:
@@ -228,12 +253,14 @@ def _restart_streamdeck_soon() -> None:
                 _log(f"StreamDeck.exe not found at {exe}")
                 return
             # Off the request thread: the other computer waits on /claim.
-            threading.Thread(
+            thread = threading.Thread(
                 target=_restart_streamdeck_windows,
                 args=(exe,),
                 name="streamdeck-restart",
                 daemon=True,
-            ).start()
+            )
+            thread.start()
+            _restart_threads.append(thread)
         elif sys.platform == "darwin":
             script = (
                 'sleep 2; '
@@ -307,11 +334,19 @@ def _restart_streamdeck_windows(exe: Path) -> None:
     _log("scheduled StreamDeck.exe restart after claim")
 
 
+def _wait_for_restart(timeout: float) -> None:
+    """Let a pending Elgato restart finish before a short-lived process exits."""
+    deadline = time.monotonic() + timeout
+    for thread in list(_restart_threads):
+        thread.join(max(0.0, deadline - time.monotonic()))
+
+
 def claim_local() -> str:
     """Take the Stream Deck on this computer."""
     settings = hub_settings()
     last_error: Exception | None = None
-    for attempt in range(1, 6):
+    started = time.monotonic()
+    for attempt in range(1, _CLAIM_ATTEMPTS + 1):
         deck = _disable_auto_use(_find_deck(settings), settings)
         if deck["in_use_by_me"] and not deck["auto_use"]:
             return f"already on this computer ({deck['name']})"
@@ -326,6 +361,8 @@ def claim_local() -> str:
         except Exception as exc:
             last_error = exc
             _log(f"claim attempt {attempt} failed: {exc}")
+        if time.monotonic() - started >= _CLAIM_RETRY_WINDOW:
+            break
         time.sleep(1.0)
     raise RuntimeError(str(last_error) if last_error else "claim failed")
 
@@ -354,12 +391,103 @@ def _normalize_mac(value: str) -> str:
     return text if _valid_mac(text) else ""
 
 
+_state_lock = threading.RLock()
+_STATE_LOCK_FILE = Path(tempfile.gettempdir()) / (
+    "streamdeck-hub-"
+    + hashlib.sha1(str(Path(__file__).resolve().parent).encode("utf-8")).hexdigest()[:12]
+    + ".lock"
+)
+
+
 def _read_json(path: Path) -> dict:
+    """Read a state file. A torn or locked file is retried, not treated as absent."""
+    for attempt in range(5):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            if attempt == 4:
+                return {}
+            time.sleep(0.05)
+            continue
+        return data if isinstance(data, dict) else {}
+    return {}
+
+
+def _write_json(path: Path, data: dict) -> None:
+    """Replace a state file in one step; other processes read it at any time."""
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(data) + "\n")
+        for attempt in range(10):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                # Windows refuses while another process has the file open.
+                if attempt == 9:
+                    raise
+                time.sleep(0.05)
+    finally:
+        with contextlib.suppress(OSError):
+            Path(tmp).unlink(missing_ok=True)
+
+
+def _lock_handle(handle, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
+def _unlock_handle(handle) -> None:
+    with contextlib.suppress(OSError):
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _state_locked():
+    """Serialize read-modify-write of state files across threads and processes.
+
+    The file lock is best effort: if it cannot be taken in time the update
+    still runs under the in-process lock.
+    """
+    with _state_lock:
+        try:
+            handle = open(_STATE_LOCK_FILE, "a+b")
+        except OSError:
+            handle = None
+        locked = handle is not None and _lock_handle(handle)
+        try:
+            yield
+        finally:
+            if handle is not None:
+                if locked:
+                    _unlock_handle(handle)
+                handle.close()
 
 
 def resolved_peer_url(settings: dict | None = None) -> str:
@@ -383,10 +511,11 @@ def remember_peer_host(host: str) -> None:
     url = f"http://{url_host}:{settings['listen_port']}"
     if settings["peer_url"]:
         return
-    current = _read_json(SEEN_PEER_FILE).get("peer_url")
-    if current == url:
-        return
-    SEEN_PEER_FILE.write_text(json.dumps({"peer_url": url}) + "\n", encoding="utf-8")
+    with _state_locked():
+        current = _read_json(SEEN_PEER_FILE).get("peer_url")
+        if current == url:
+            return
+        _write_json(SEEN_PEER_FILE, {"peer_url": url})
     _log(f"Learned the other computer at {url}")
 
 
@@ -470,8 +599,11 @@ def peer_scan_hosts() -> list[str]:
 _discover_lock = threading.Lock()
 
 
-def _probe_hub(host: str, port: int, token: str, timeout: float) -> dict | None:
-    """Return /health JSON when this host is running the other side's hub."""
+def _probe_hub(host: str, port: int, timeout: float) -> dict | None:
+    """Return /health JSON when this host is running the other side's hub.
+
+    No token is sent: any host on the LAN with this port open answers here.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
@@ -482,8 +614,6 @@ def _probe_hub(host: str, port: int, token: str, timeout: float) -> dict | None:
     finally:
         sock.close()
     request = urllib.request.Request(f"http://{host}:{port}/health", method="GET")
-    if token:
-        request.add_header("X-Hub-Token", token)
     try:
         with urllib.request.urlopen(request, timeout=1.5) as response:
             raw = response.read().decode("utf-8", errors="replace")
@@ -534,14 +664,13 @@ def discover_peer_url(settings: dict | None = None) -> str:
             return ""
         _log(f"Looking for the other computer on the local network ({len(hosts)} addresses).")
         port = int(settings["listen_port"])
-        token = str(settings["token"] or "")
         found = ""
         legacy: list[str] = []
         workers = min(32, len(hosts))
         pool = ThreadPoolExecutor(max_workers=workers)
         try:
             pending = {
-                pool.submit(_probe_hub, host, port, token, 0.3): host for host in hosts
+                pool.submit(_probe_hub, host, port, 0.3): host for host in hosts
             }
             for future in as_completed(pending):
                 host = pending[future]
@@ -558,14 +687,12 @@ def discover_peer_url(settings: dict | None = None) -> str:
                     legacy.append(host)
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
-        if not found and len(legacy) == 1:
-            found = legacy[0]
-            _log(f"Found an older hub at {found}.")
-        elif not found and len(legacy) > 1:
+        if not found and legacy:
+            # An older hub cannot say which side it is; it gets no token unasked.
             _log(
-                "Several computers answered like an older hub ("
+                "Found an older hub that cannot identify itself ("
                 + ", ".join(legacy)
-                + "). Set streamdeck_hub.peer_url to the right one."
+                + "). Update it, or set streamdeck_hub.peer_url."
             )
         if not found:
             _log("The other computer did not answer on this network.")
@@ -584,11 +711,12 @@ def remember_wake_mac(which: str, mac: str) -> None:
     mac = _normalize_mac(mac)
     if not mac:
         return
-    data = _read_json(WAKE_FILE)
-    if data.get(which) == mac:
-        return
-    data[which] = mac
-    WAKE_FILE.write_text(json.dumps(data) + "\n", encoding="utf-8")
+    with _state_locked():
+        data = _read_json(WAKE_FILE)
+        if data.get(which) == mac:
+            return
+        data[which] = mac
+        _write_json(WAKE_FILE, data)
     _log(f"Learned wake address for {owner_name(which)}")
 
 
@@ -602,7 +730,35 @@ def local_lan_mac() -> str:
     return mac
 
 
+def _lan_source_ip() -> str:
+    """Our address on the route to the other computer, else on the default route.
+
+    Connecting a UDP socket only picks a route; nothing is sent.
+    """
+    target = "192.0.2.1"
+    host = urllib.parse.urlsplit(resolved_peer_url()).hostname or ""
+    try:
+        ipaddress.IPv4Address(host)
+        target = host
+    except ValueError:
+        pass
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect((target, 9))
+        return str(sock.getsockname()[0])
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+
+
 def _read_lan_mac() -> str:
+    try:
+        source = _lan_source_ip()
+    except Exception:
+        source = ""
+    if source in ("0.0.0.0", "127.0.0.1"):
+        source = ""
     if sys.platform == "darwin":
         result = _run_hidden(["ifconfig"], timeout=5)
         current = {"mac": "", "ips": []}
@@ -623,12 +779,22 @@ def _read_lan_mac() -> str:
         if current["mac"] or current["ips"]:
             blocks.append(current)
         for block in blocks:
-            if block["mac"] and any(ip.startswith("192.168.68.") for ip in block["ips"]):
+            if source and block["mac"] and source in block["ips"]:
                 return block["mac"]
         for block in blocks:
             if block["mac"] and block["ips"]:
                 return block["mac"]
         return ""
+    if source:
+        result = _run_hidden(["ipconfig", "/all"], timeout=8)
+        own_ip = re.compile(rf"(?<![\d.]){re.escape(source)}(?!\d)")
+        for block in re.split(r"\n(?=\S)", result.stdout or ""):
+            if not own_ip.search(block):
+                continue
+            match = _WINDOWS_MAC.search(block)
+            mac = _normalize_mac(match.group(0)) if match else ""
+            if mac:
+                return mac
     result = _run_hidden(["getmac", "/fo", "csv", "/v", "/nh"], timeout=8)
     for line in (result.stdout or "").splitlines():
         if "disconnected" in line.lower() or "hardware not present" in line.lower():
@@ -647,15 +813,65 @@ def build_wol_packet(mac: str) -> bytes:
     return b"\xff" * 6 + mac_bytes * 16
 
 
-def send_wol(mac: str) -> None:
+def wol_broadcasts(settings: dict | None = None) -> list[str]:
+    """Every address that can carry a magic packet from this computer.
+
+    Limited broadcast only leaves through the default interface, and a /22
+    LAN's directed broadcast is not x.x.x.255, so each interface's real
+    broadcast gets a copy too.
+    """
+    settings = settings or hub_settings()
+    found = ["255.255.255.255"]
+    extra = str(settings.get("wol_broadcast") or "").strip()
+    if extra:
+        try:
+            extra = str(ipaddress.IPv4Address(extra))
+        except ValueError:
+            _log(f"Ignoring streamdeck_hub.wol_broadcast {extra!r}: not an IPv4 address")
+        else:
+            if extra not in found:
+                found.append(extra)
+    try:
+        cidrs = _interface_cidrs()
+    except Exception as exc:
+        _log(f"Could not list network interfaces for wake: {exc}")
+        cidrs = []
+    for ip, prefix in cidrs:
+        try:
+            interface = ipaddress.IPv4Interface(f"{ip}/{prefix}")
+        except ValueError:
+            continue
+        address = interface.ip
+        if address.is_loopback or address.is_link_local or not address.is_private:
+            continue
+        if interface.network.prefixlen >= 31:
+            continue
+        broadcast = str(interface.network.broadcast_address)
+        if broadcast not in found:
+            found.append(broadcast)
+    return found
+
+
+def send_wol(mac: str, settings: dict | None = None) -> None:
     packet = build_wol_packet(mac)
+    targets = wol_broadcasts(settings)
+    sent = 0
+    last_error: OSError | None = None
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.sendto(packet, ("255.255.255.255", 9))
-        sock.sendto(packet, ("255.255.255.255", 7))
+        for _ in range(3):
+            for address in targets:
+                for port in (9, 7):
+                    try:
+                        sock.sendto(packet, (address, port))
+                        sent += 1
+                    except OSError as exc:
+                        last_error = exc
     finally:
         sock.close()
+    if not sent and last_error is not None:
+        raise last_error
 
 
 def wake_machine(which: str) -> str:
@@ -670,7 +886,7 @@ def wake_machine(which: str) -> str:
             f"No wake address for {owner_name(which)} yet. "
             "Leave that computer on once so this one can learn it."
         )
-    send_wol(mac)
+    send_wol(mac, settings)
     note = f"wake sent to {owner_name(which)}"
     _log(note)
     return note
@@ -706,10 +922,28 @@ def peer_status(settings: dict | None = None) -> dict | None:
     return data
 
 
+def _suspend_power_follow() -> None:
+    global _suspend_follow, _suspend_follow_until
+    _suspend_follow_until = time.time() + _SUSPEND_FOLLOW_MAX
+    _suspend_follow = True
+
+
+def _resume_power_follow() -> None:
+    global _suspend_follow
+    _suspend_follow = False
+
+
+def _follow_suspended() -> bool:
+    global _suspend_follow
+    if _suspend_follow and time.time() >= _suspend_follow_until:
+        _suspend_follow = False
+        _log("Power follow is back on after the sleep handoff.")
+    return _suspend_follow
+
+
 def claim_if_alone() -> str | None:
     """Take the deck when the other computer is off and we do not hold it."""
-    global _suspend_follow
-    if _suspend_follow:
+    if _follow_suspended():
         return None
     settings = hub_settings()
     if not settings["enabled"] or not settings["follow_power"]:
@@ -729,14 +963,13 @@ def claim_if_alone() -> str | None:
 
 def release_for_power_off() -> str:
     """Give the deck to the computer that is still on, before we sleep."""
-    global _suspend_follow
-    _suspend_follow = True
+    _suspend_power_follow()
     settings = hub_settings()
     if not settings["enabled"] or not settings["follow_power"]:
         return "power follow is off"
     if peer_status(settings) is not None:
         local = release_local()
-        peer = _post_peer("/claim")
+        _status, peer = _post_peer("/claim", _SLEEP_HANDOFF_WAIT)
         note = f"sleep handoff: {local}; {peer}"
     else:
         note = "sleep handoff: " + release_local()
@@ -748,6 +981,8 @@ def _follow_loop() -> None:
     misses = 0
     announced = False
     next_discover = 0.0
+    claim_delay = 0.0
+    next_claim = 0.0
     while True:
         time.sleep(4)
         try:
@@ -764,22 +999,31 @@ def _follow_loop() -> None:
                         announced = True
                     continue
             announced = False
-            if _suspend_follow:
+            if _follow_suspended():
                 continue
             if peer_status(settings) is not None:
                 misses = 0
+                claim_delay = 0.0
+                next_claim = 0.0
                 continue
             misses += 1
-            if misses < 3:
+            if misses < 3 or time.monotonic() < next_claim:
                 continue
-            claim_if_alone()
+            try:
+                claim_if_alone()
+            except Exception as exc:
+                claim_delay = min(_CLAIM_BACKOFF_MAX, max(8.0, claim_delay * 2))
+                next_claim = time.monotonic() + claim_delay
+                _log(f"Power follow: {exc} (next try in {claim_delay:.0f}s)")
+                continue
+            claim_delay = 0.0
+            next_claim = 0.0
         except Exception as exc:
             _log(f"Power follow: {exc}")
 
 
 def _after_wake() -> None:
-    global _suspend_follow
-    _suspend_follow = False
+    _resume_power_follow()
     time.sleep(3)
     try:
         note = claim_if_alone()
@@ -789,23 +1033,28 @@ def _after_wake() -> None:
         _log(f"Wake claim failed: {exc}")
 
 
+def _sleep_handoff() -> None:
+    """Run the sleep handoff, blocking the power callback as long as the OS waits."""
+    done = threading.Event()
+
+    def work() -> None:
+        try:
+            release_for_power_off()
+        except Exception as exc:
+            _log(f"Sleep handoff failed: {exc}")
+        finally:
+            done.set()
+
+    threading.Thread(target=work, name="streamdeck-sleep-handoff", daemon=True).start()
+    if not done.wait(_SLEEP_HANDOFF_WAIT):
+        _log("Sleep handoff still running when the computer went to sleep.")
+
+
 def _power_callback_mac(message_type: int) -> None:
-    global _suspend_follow
     if message_type == _IO_WILL_SLEEP:
-        done = threading.Event()
-
-        def work() -> None:
-            try:
-                release_for_power_off()
-            except Exception as exc:
-                _log(f"Sleep handoff failed: {exc}")
-            finally:
-                done.set()
-
-        threading.Thread(target=work, daemon=True).start()
-        done.wait(5)
+        _sleep_handoff()
     elif message_type == _IO_WILL_NOT_SLEEP:
-        _suspend_follow = False
+        _resume_power_follow()
     elif message_type == _IO_HAS_POWERED_ON:
         threading.Thread(target=_after_wake, name="streamdeck-wake", daemon=True).start()
 
@@ -874,18 +1123,7 @@ def _start_windows_power_hook() -> None:
     def _callback(_context, type_, _setting):
         try:
             if type_ == _PBT_APMSUSPEND:
-                done = threading.Event()
-
-                def work() -> None:
-                    try:
-                        release_for_power_off()
-                    except Exception as exc:
-                        _log(f"Sleep handoff failed: {exc}")
-                    finally:
-                        done.set()
-
-                threading.Thread(target=work, daemon=True).start()
-                done.wait(5)
+                _sleep_handoff()
             elif type_ == _PBT_APMRESUMEAUTOMATIC:
                 threading.Thread(target=_after_wake, name="streamdeck-wake", daemon=True).start()
         except Exception as exc:
@@ -929,39 +1167,68 @@ def start_power_follow() -> None:
         _start_windows_power_hook()
 
 
-def _post_peer(path: str) -> str:
+def _post_peer(path: str, timeout: float = 8) -> tuple[str, str]:
+    """POST to the other computer. Returns ``(status, message)``.
+
+    ``ok``: it answered 200. ``uncertain``: the request went out but no answer
+    came back, so it may still be working on it. ``unreachable``, ``failed``
+    and ``not configured`` mean it did not or could not act.
+    """
     settings = hub_settings()
     peer = resolved_peer_url(settings)
     if not peer:
-        return "other computer not configured (streamdeck_hub.peer_url)"
+        return "not configured", "other computer not configured (streamdeck_hub.peer_url)"
     url = peer + path
     request = urllib.request.Request(url, data=b"", method="POST")
     token = settings["token"]
     if token:
         request.add_header("X-Hub-Token", token)
     try:
-        with urllib.request.urlopen(request, timeout=8) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="replace").strip()
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        with contextlib.suppress(OSError):
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+        return "failed", f"other computer failed ({exc.code}: {detail or exc.reason})"
     except urllib.error.URLError as exc:
-        return f"other computer unreachable ({exc.reason})"
-    return body or "ok"
+        return "unreachable", f"other computer unreachable ({exc.reason})"
+    except TimeoutError:
+        return "uncertain", f"other computer timed out after {timeout:.0f}s"
+    except (OSError, http.client.HTTPException) as exc:
+        return "uncertain", f"other computer dropped the connection ({exc!r})"
+    return "ok", body or "ok"
+
+
+def _await_peer_claim(settings: dict, note: str) -> tuple[str, str]:
+    """After an unanswered /claim, watch VirtualHere for who ends up with the deck."""
+    deadline = time.monotonic() + _HANDOFF_SETTLE
+    while True:
+        deck = None
+        try:
+            deck = _find_deck(settings)
+        except Exception as exc:
+            _log(f"Handoff check failed: {exc}")
+        if deck and deck["in_use_by_me"]:
+            return "here", f"{note}; the deck is still on this computer"
+        if deck and deck["in_use"]:
+            return "ok", f"{note}; it has the deck now"
+        if time.monotonic() >= deadline:
+            return "failed", f"{note}; nobody took the deck"
+        time.sleep(2)
 
 
 SELECTION_FILE = Path(__file__).resolve().parent / "deck_selection.json"
 
 
 def read_selected() -> str | None:
-    try:
-        data = json.loads(SELECTION_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    owner = str(data.get("owner") or "")
+    owner = str(_read_json(SELECTION_FILE).get("owner") or "")
     return owner if owner in ("a", "b") else None
 
 
 def write_selected(owner: str) -> None:
     which = "b" if owner == "b" else "a"
-    SELECTION_FILE.write_text(json.dumps({"owner": which}) + "\n", encoding="utf-8")
+    _write_json(SELECTION_FILE, {"owner": which})
 
 
 def displayed_owner() -> str:
@@ -994,7 +1261,8 @@ def toggle_deck_owner(target: str | None = None) -> str:
 
     Monitor inputs are not touched. The chosen side is saved only after the
     handoff is accepted. A failed press leaves the key on the computer that
-    still has the deck.
+    still has the deck. If the other computer goes quiet mid-claim, the deck
+    is only taken back once VirtualHere shows that nobody has it.
     """
     settings = hub_settings()
     if not settings["enabled"]:
@@ -1008,33 +1276,45 @@ def toggle_deck_owner(target: str | None = None) -> str:
             "Could not find the other computer on this network. "
             "Open Stream Deck there, or set streamdeck_hub.peer_url."
         )
-    write_selected(target)
     try:
         if sending_away:
             local = release_local()
-            peer = _post_peer("/claim")
-            if "unreachable" in peer or "not configured" in peer:
+            status, peer = _post_peer("/claim", _PEER_CLAIM_TIMEOUT)
+            if status == "uncertain":
+                _log(f"{peer}; checking who has the deck")
+                status, peer = _await_peer_claim(settings, peer)
+            if status == "here":
+                raise RuntimeError(peer)
+            if status != "ok":
                 try:
                     claim_local()
                 except Exception as exc:
                     _log(f"Could not take the deck back: {exc}")
                 raise RuntimeError(peer)
         else:
-            peer = _post_peer("/release")
+            _status, peer = _post_peer("/release", _PEER_RELEASE_TIMEOUT)
             local = claim_local()
     except Exception:
         write_selected(previous)
         raise
+    write_selected(target)
     note = f"{owner_name(target)}: {local}; {peer}"
     _log(note)
     return note
 
 
 class _HubHandler(BaseHTTPRequestHandler):
+    timeout = 5
+
     def do_GET(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path == "/health" and not self._token_ok():
+            # Discovery asks which side we are before it sends the token.
+            identity = {"ok": True, "local_pc": hub_settings()["local_pc"]}
+            self._reply(200, json.dumps(identity))
+            return
         if not self._authorized():
             return
-        path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path != "/health":
             self._reply(404, "not found")
             return
@@ -1052,6 +1332,9 @@ class _HubHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         if not self._authorized():
             return
+        body = self._read_body()
+        if body is None:
+            return
         self._note_caller()
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         try:
@@ -1060,7 +1343,7 @@ class _HubHandler(BaseHTTPRequestHandler):
             elif path == "/release":
                 message = release_local()
             elif path == "/layout":
-                message = _apply_hub_layout(self)
+                message = _apply_hub_layout(body)
             else:
                 self._reply(404, "not found")
                 return
@@ -1071,14 +1354,40 @@ class _HubHandler(BaseHTTPRequestHandler):
         _log(f"{path} -> {message}")
         self._reply(200, message)
 
-    def _authorized(self) -> bool:
+    def _token_ok(self) -> bool:
         settings = hub_settings()
         token = settings["token"]
         got = self.headers.get("X-Hub-Token", "")
-        if token and not hmac.compare_digest(got, token):
+        return not token or hmac.compare_digest(got, token)
+
+    def _authorized(self) -> bool:
+        if not self._token_ok():
             self._reply(403, "forbidden")
             return False
         return True
+
+    def _read_body(self) -> bytes | None:
+        """Request body, or None after replying 400/413 to a bad one."""
+        raw = (self.headers.get("Content-Length") or "").strip()
+        if not raw:
+            return b""
+        try:
+            length = int(raw)
+        except ValueError:
+            length = -1
+        if length < 0:
+            self._reply(400, "bad Content-Length")
+            return None
+        if length > _MAX_BODY:
+            self._reply(413, "request body too large")
+            return None
+        if length == 0:
+            return b""
+        try:
+            return self.rfile.read(length)
+        except OSError:
+            self.close_connection = True
+            return None
 
     def _note_caller(self) -> None:
         try:
@@ -1099,11 +1408,10 @@ class _HubHandler(BaseHTTPRequestHandler):
         _log(fmt % args)
 
 
-def _apply_hub_layout(handler: _HubHandler) -> str:
-    length = int(handler.headers.get("Content-Length") or 0)
+def _apply_hub_layout(body: bytes) -> str:
     name = "office"
-    if length > 0:
-        raw = handler.rfile.read(length).decode("utf-8", errors="replace")
+    if body:
+        raw = body.decode("utf-8", errors="replace")
         try:
             payload = json.loads(raw or "{}")
         except json.JSONDecodeError:
@@ -1117,6 +1425,18 @@ def _apply_hub_layout(handler: _HubHandler) -> str:
     return "; ".join(lines) or f"layout {name} applied"
 
 
+class _HubServer(ThreadingHTTPServer):
+    daemon_threads = True
+    # SO_REUSEADDR on Windows lets a second process bind the same port.
+    allow_reuse_address = sys.platform != "win32"
+
+    def server_bind(self) -> None:
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if sys.platform == "win32" and exclusive is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        super().server_bind()
+
+
 def ensure_hub_listener() -> None:
     """Listen for claim/release from the other computer, once per process."""
     global _started
@@ -1127,7 +1447,7 @@ def ensure_hub_listener() -> None:
         if _started:
             return
         try:
-            server = ThreadingHTTPServer(
+            server = _HubServer(
                 (settings["listen_host"], settings["listen_port"]),
                 _HubHandler,
             )
@@ -1152,14 +1472,16 @@ def main() -> int:
     target = sys.argv[2] if len(sys.argv) > 2 else ""
     if command == "claim":
         print(claim_local())
+        _wait_for_restart(30)
     elif command == "release":
         print(release_local())
     elif command == "wake":
         print(wake_machine(target or "b"))
     elif command == "status":
         settings = hub_settings()
+        shown = dict(settings, token="***" if settings["token"] else "")
         print(json.dumps({
-            "settings": settings,
+            "settings": shown,
             "peer_url": resolved_peer_url(settings),
             "wake": {"a": known_wake_mac("a"), "b": known_wake_mac("b")},
             "devices": parse_list(_run_client("LIST", settings)),
