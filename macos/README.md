@@ -141,7 +141,7 @@ on the keys. The same three controls are on the **Off** page in Elgato, one
 press of Next from the monitor page. Wake-on-LAN has to be enabled on both.
 
 Drag **Mac / PC** onto a key on both computers. Pressing it runs this plugin
-(`launch.sh` on the Mac, `launch.bat` on Windows) and does not touch monitors.
+(`launch.sh` on the Mac, `launch.exe` on Windows) and does not touch monitors.
 
 What the Windows machine still needs:
 

@@ -88,7 +88,7 @@ New-Item -ItemType SymbolicLink `
 
 `$PWD` must be the repo root. Quit and reopen Stream Deck. In the **Monitor Input Switcher** category, drag **Mac / PC** onto a key. Do not put it on top of **PC Switch**.
 
-`launch.bat` runs `py -3`. If Stream Deck says the plugin failed, `py -3` is missing from PATH.
+`launch.exe` starts `pythonw` with no console window. If Stream Deck says the plugin failed, Python 3 is missing (`py -3` / `pythonw.exe`).
 
 ## 6. Start the listener before the deck arrives
 

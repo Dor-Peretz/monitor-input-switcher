@@ -10,7 +10,7 @@
   "CategoryIcon": "imgs/plugin",
   "URL": "https://github.com/Dor-Peretz/monitor-input-switcher",
   "CodePath": "launch.sh",
-  "CodePathWin": "launch.bat",
+  "CodePathWin": "launch.exe",
   "SDKVersion": 2,
   "Software": {
     "MinimumVersion": "6.5"

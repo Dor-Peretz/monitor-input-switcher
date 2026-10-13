@@ -1,6 +1,7 @@
 @echo off
-REM Stream Deck on Windows launches this. The plugin folder must stay inside
-REM the repo (a symlink is fine) so plugin.py can reach the Windows DDC helpers.
+REM Manual/debug launcher. Stream Deck on Windows starts launch.exe so no
+REM console window stays open. The plugin folder must stay inside the repo
+REM (a symlink is fine) so plugin.py can reach the Windows DDC helpers.
 set "PLUGIN_DIR=%~dp0"
 where py >nul 2>&1 && (
   py -3 "%PLUGIN_DIR%plugin.py" %*
