@@ -212,7 +212,7 @@ def _restart_streamdeck_soon() -> None:
     Without this, Windows often keeps showing the old (empty) session until you
     manually restart Stream Deck — which feels like having to reinstall it.
 
-    The restart runs in a *detached* process so it still finishes when claim was
+    The restart runs in a separate process so it still finishes when claim was
     handled inside the Stream Deck plugin (killing StreamDeck.exe would otherwise
     kill this Python process mid-restart).
     """
@@ -227,31 +227,13 @@ def _restart_streamdeck_soon() -> None:
             if not exe.is_file():
                 _log(f"StreamDeck.exe not found at {exe}")
                 return
-            # cmd.exe outlives the plugin; delay, kill, relaunch.
-            # Do not use `start "" "C:\...\exe"`: with DETACHED_PROCESS and
-            # redirected stdin, cmd's start treats that as the path `\\` and
-            # Windows pops "cannot find '\\'". ping delays survive NUL stdin;
-            # `timeout` does not. /D + the exe name avoids the empty-title trap.
-            folder = str(exe.parent)
-            script = (
-                f"ping -n 3 127.0.0.1 >nul & "
-                f"taskkill /IM StreamDeck.exe /F >nul 2>&1 & "
-                f"ping -n 2 127.0.0.1 >nul & "
-                f'start /d "{folder}" {exe.name}'
-            )
-            flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-            flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-            flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            subprocess.Popen(
-                ["cmd.exe", "/c", script],
-                cwd=folder,
-                creationflags=flags,
-                close_fds=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            _log("scheduled StreamDeck.exe restart after claim")
+            # Off the request thread: the other computer waits on /claim.
+            threading.Thread(
+                target=_restart_streamdeck_windows,
+                args=(exe,),
+                name="streamdeck-restart",
+                daemon=True,
+            ).start()
         elif sys.platform == "darwin":
             script = (
                 'sleep 2; '
@@ -270,6 +252,59 @@ def _restart_streamdeck_soon() -> None:
             _log("scheduled Elgato Stream Deck restart after claim")
     except Exception as exc:
         _log(f"Stream Deck restart after claim failed: {exc}")
+
+
+def _restart_streamdeck_windows(exe: Path) -> None:
+    """Kill and relaunch StreamDeck.exe from a process outside our job object.
+
+    The plugin runs inside launch.exe's kill-on-close job, and every child it
+    starts joins that job, DETACHED_PROCESS or not. Killing Elgato ends the
+    plugin, launch.exe exits, and Windows kills the restart script before it
+    relaunches Elgato. A process created through WMI is not in the job.
+    """
+    folder = str(exe.parent)
+    # ping delays work in a hidden console; `timeout` does not. The script runs
+    # in `folder`, so `start` finds the exe without a quoted path.
+    script = (
+        "ping -n 3 127.0.0.1 >nul & "
+        f"taskkill /IM {exe.name} /F >nul 2>&1 & "
+        "ping -n 2 127.0.0.1 >nul & "
+        f"start {exe.name}"
+    )
+
+    def quoted(text: str) -> str:
+        return "'" + text.replace("'", "''") + "'"
+
+    command = (
+        "$startup = ([wmiclass]'Win32_ProcessStartup').CreateInstance(); "
+        "$startup.ShowWindow = 0; "
+        "$result = ([wmiclass]'Win32_Process').Create("
+        f"{quoted('cmd.exe /c ' + script)}, {quoted(folder)}, $startup); "
+        "exit [int]$result.ReturnValue"
+    )
+    powershell = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    try:
+        result = _run_hidden(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-Command", command],
+            timeout=20,
+        )
+    except Exception as exc:
+        _log(f"Stream Deck restart after claim failed: {exc}")
+        return
+    if result.returncode != 0:
+        detail = ((result.stdout or "") + (result.stderr or "")).strip()
+        _log(
+            f"Stream Deck restart after claim failed (code {result.returncode}). "
+            f"{detail}"
+        )
+        return
+    _log("scheduled StreamDeck.exe restart after claim")
 
 
 def claim_local() -> str:
