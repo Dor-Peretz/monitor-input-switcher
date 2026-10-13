@@ -39,6 +39,8 @@ IMAGE_REPORT_LENGTH = 1024
 IMAGE_HEADER_LENGTH = 8
 HUB_PORT = 8765
 HUB_RESCAN_SECONDS = 600.0
+# Hubs remember whoever calls them as "the other computer" unless told otherwise.
+HUB_CALLER_HEADER = ("X-Hub-Caller", "standby")
 
 # Same Home Assistant folder as the Elgato profile. column, row.
 HA_KEYS = {
@@ -232,10 +234,10 @@ def lan_hosts() -> list[str]:
 
 def probe_hub(host: str, timeout: float = 1.0) -> str:
     """``a`` or ``b`` when a monitor-switcher hub answers on ``host``, else ``""``."""
+    request = urllib.request.Request(f"http://{host}:{HUB_PORT}/health")
+    request.add_header(*HUB_CALLER_HEADER)
     try:
-        with urllib.request.urlopen(
-            f"http://{host}:{HUB_PORT}/health", timeout=timeout
-        ) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read(4096).decode("utf-8", errors="replace"))
     except Exception:
         return ""
@@ -316,6 +318,7 @@ class HubFinder:
             self.rescan(force=True)
             return False
         request = urllib.request.Request(f"{url}/claim", data=b"", method="POST")
+        request.add_header(*HUB_CALLER_HEADER)
         with self._lock:
             if self.token:
                 request.add_header("X-Hub-Token", self.token)

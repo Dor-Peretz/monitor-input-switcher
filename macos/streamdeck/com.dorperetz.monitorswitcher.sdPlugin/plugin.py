@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import json
 import queue
 import sys
 import threading
@@ -566,16 +565,6 @@ class Plugin:
             except Exception as exc:  # keep the key display alive no matter what
                 log(f"Refresh loop error: {exc}")
 
-    def load_devices(self, info: str) -> None:
-        """Decks Elgato already showed when it started this plugin (``-info``)."""
-        try:
-            devices = json.loads(info or "{}").get("devices") or []
-        except (ValueError, AttributeError):
-            devices = []
-        for device in devices:
-            if isinstance(device, dict) and is_hardware_deck(device):
-                self._elgato_devices.add(str(device.get("id") or ""))
-
     def _note_elgato(self, force: bool = False) -> None:
         """Tell the hub whether Elgato shows a deck; its watchdog acts on this."""
         now = time.monotonic()
@@ -791,7 +780,6 @@ def main() -> int:
 
     client = StreamDeckClient(args.port, args.plugin_uuid, args.register_event)
     plugin = Plugin(client)
-    plugin.load_devices(args.info)
     try:
         client.connect()
         plugin.start_workers()

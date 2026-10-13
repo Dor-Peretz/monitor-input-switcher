@@ -279,9 +279,14 @@ def _restart_streamdeck_soon() -> None:
             thread.start()
             _restart_threads.append(thread)
         elif sys.platform == "darwin":
+            # `open` while Elgato is still quitting only focuses the dying app,
+            # so wait for the process to be gone before reopening it.
             script = (
                 'sleep 2; '
                 'osascript -e \'quit app "Elgato Stream Deck"\' >/dev/null 2>&1; '
+                'i=0; while pgrep -xq "Stream Deck" && [ $i -lt 30 ]; do '
+                'sleep 0.5; i=$((i+1)); done; '
+                'pkill -x "Stream Deck" >/dev/null 2>&1; '
                 'sleep 1; '
                 'open -a "Elgato Stream Deck"'
             )
@@ -1496,6 +1501,8 @@ class _HubHandler(BaseHTTPRequestHandler):
             return None
 
     def _note_caller(self) -> None:
+        if self.headers.get("X-Hub-Caller") == "standby":
+            return
         try:
             host = self.client_address[0]
         except (IndexError, TypeError):

@@ -1499,6 +1499,8 @@ class _HubHandler(BaseHTTPRequestHandler):
             return None
 
     def _note_caller(self) -> None:
+        if self.headers.get("X-Hub-Caller") == "standby":
+            return
         try:
             host = self.client_address[0]
         except (IndexError, TypeError):
