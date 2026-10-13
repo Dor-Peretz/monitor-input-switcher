@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -58,19 +61,53 @@ def load_config(path: Path | None = None) -> dict:
         save_config(deepcopy(DEFAULT_CONFIG), path)
         return deepcopy(DEFAULT_CONFIG)
 
-    with path.open(encoding="utf-8") as handle:
-        data = json.load(handle)
+    try:
+        with path.open(encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Config file {path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file {path} must contain a JSON object")
 
     return migrate_config(data)
 
 
 def save_config(data: dict, path: Path | None = None) -> None:
     path = path or config_path()
-    data = migrate_config(data)
+    data = migrate_config(deepcopy(data))
     data["version"] = CONFIG_VERSION
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
-        handle.write("\n")
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    tmp_path = Path(handle.name)
+    try:
+        with handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace_file(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _replace_file(source: Path, target: Path, attempts: int = 5) -> None:
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            # Windows refuses to replace a file another process (tray reload,
+            # Stream Deck hub, antivirus) briefly has open.
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def migrate_config(data: dict) -> dict:

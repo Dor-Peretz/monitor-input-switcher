@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import sys
 import threading
 import tkinter as tk
 from copy import deepcopy
@@ -79,6 +80,9 @@ class HotkeyCapture(ttk.Entry):
         "Meta_L",
         "Meta_R",
     }
+    PLACEHOLDER = "Press shortcut..."
+    # Tk on Windows reports Alt as 0x20000; 0x0008 (Mod1) there is NumLock.
+    ALT_MASK = 0x20000 if sys.platform == "win32" else 0x0008
 
     def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
@@ -99,13 +103,13 @@ class HotkeyCapture(ttk.Entry):
         self._capturing = True
         self.configure(state="normal")
         self.delete(0, tk.END)
-        self.insert(0, "Press shortcut...")
+        self.insert(0, self.PLACEHOLDER)
         self.select_range(0, tk.END)
 
     def _stop_capture(self, _event=None) -> None:
         self._capturing = False
         self.configure(state="readonly")
-        if self.get() == "Press shortcut...":
+        if self.get() == self.PLACEHOLDER:
             self.delete(0, tk.END)
 
     def _on_key_press(self, event) -> str:
@@ -118,7 +122,7 @@ class HotkeyCapture(ttk.Entry):
         modifiers = 0
         if event.state & 0x0004:
             modifiers |= 0x0002
-        if event.state & 0x0008 or event.state & 0x20000:
+        if event.state & self.ALT_MASK:
             modifiers |= 0x0001
         if event.state & 0x0001:
             modifiers |= 0x0004
@@ -456,18 +460,35 @@ class MonitorSwitcherUI:
         for child in frame.winfo_children():
             child.destroy()
 
+    @staticmethod
+    def _match_saved_entries(
+        entries: list, monitors: list[MonitorInfo]
+    ) -> dict[str, int]:
+        """Map each live monitor's device_name to the index of its saved entry."""
+        matched: dict[str, int] = {}
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            monitor = resolve_monitor(monitors, entry)
+            if monitor is not None and monitor.device_name not in matched:
+                matched[monitor.device_name] = index
+        return matched
+
+    def _saved_entries_by_device(self, entries: list, monitors: list[MonitorInfo]) -> dict:
+        matched = self._match_saved_entries(entries, monitors)
+        return {device: entries[index] for device, index in matched.items()}
+
     def _render_monitor_rows(self, monitors: list[MonitorInfo]) -> None:
         self.monitor_rows = []
         self._clear_frame(self.monitor_rows_frame)
 
-        saved = {
-            (entry.get("device") or entry.get("monitor", "")): entry
-            for entry in self.config.get("monitor_bindings", [])
-        }
+        saved = self._saved_entries_by_device(
+            self.config.get("monitor_bindings") or [], monitors
+        )
 
         for monitor in monitors:
             extra = self.monitor_extra.get(monitor.device_name, {})
-            saved_entry = saved.get(monitor.device_name) or saved.get(monitor.position, {})
+            saved_entry = saved.get(monitor.device_name, {})
             switchable = monitor.controllable
             reason = controllable_reason(monitor, extra)
             model = extra.get("detected_model") or monitor.description
@@ -566,14 +587,12 @@ class MonitorSwitcherUI:
         self.pc_rows = []
         self._clear_frame(self.pc_rows_frame)
 
-        saved = {
-            (entry.get("device") or entry.get("monitor", "")): entry
-            for entry in self.config.get("pc_switch", {}).get("monitors", [])
-        }
+        saved_entries = (self.config.get("pc_switch") or {}).get("monitors") or []
+        saved = self._saved_entries_by_device(saved_entries, monitors)
 
         for monitor in monitors:
             extra = self.monitor_extra.get(monitor.device_name, {})
-            saved_entry = saved.get(monitor.device_name) or saved.get(monitor.position, {})
+            saved_entry = saved.get(monitor.device_name, {})
             switchable = monitor.controllable
             model = extra.get("detected_model") or monitor.description
 
@@ -581,7 +600,7 @@ class MonitorSwitcherUI:
             title = ttk.Frame(body, style="Card.TFrame")
             title.pack(fill="x")
 
-            enabled_default = switchable and saved_entry.get("enabled", True)
+            enabled_default = switchable and saved_entry.get("enabled", not saved_entries)
             enabled = tk.BooleanVar(value=enabled_default)
             include_box = ttk.Checkbutton(title, text="Include", variable=enabled)
             include_box.pack(side="left")
@@ -780,55 +799,89 @@ class MonitorSwitcherUI:
 
         self._run_ddc(f"Switching to {name}", work)
 
+    @staticmethod
+    def _hotkey_value(capture: HotkeyCapture, fallback: str) -> str:
+        value = capture.get().strip()
+        return fallback if value == HotkeyCapture.PLACEHOLDER else value
+
+    @staticmethod
+    def _new_entry(monitor: MonitorInfo, saved: dict | None) -> dict:
+        if saved is None:
+            return {"monitor": monitor.position, "device": monitor.device_name}
+        entry = deepcopy(saved)
+        if not entry.get("device"):
+            entry["device"] = monitor.device_name
+        return entry
+
+    def _binding_from_row(self, row: dict, saved: dict | None) -> dict | None:
+        hotkey = self._hotkey_value(row["hotkey"], (saved or {}).get("hotkey", ""))
+        enabled = bool(row["enabled"].get() and hotkey)
+        if saved is None and not enabled:
+            return None
+        entry = {"enabled": enabled, **self._new_entry(row["monitor"], saved)}
+        entry.update(
+            enabled=enabled,
+            hotkey=hotkey,
+            input_a=self._combo_value(row["input_a"], 0x0F),
+            input_b=self._combo_value(row["input_b"], 0x1B),
+        )
+        return entry
+
+    def _pc_entry_from_row(self, row: dict, saved: dict | None) -> dict | None:
+        enabled = bool(row["enabled"].get())
+        if saved is None and not enabled:
+            return None
+        entry = {"enabled": enabled, **self._new_entry(row["monitor"], saved)}
+        entry.update(
+            enabled=enabled,
+            input_a=self._combo_value(row["input_a"], 0x0F),
+            input_b=self._combo_value(row["input_b"], 0x1B),
+        )
+        return entry
+
+    def _merge_rows(self, saved_entries, rows: list[dict], entry_from_row) -> list:
+        """Apply form rows onto saved entries; keep entries for absent or unswitchable monitors."""
+        if not isinstance(saved_entries, list):
+            saved_entries = []
+        matched = self._match_saved_entries(
+            saved_entries, [row["monitor"] for row in rows]
+        )
+        replaced: dict[int, dict] = {}
+        added: list[dict] = []
+        for row in rows:
+            if not row.get("switchable", True):
+                continue
+            index = matched.get(row["monitor"].device_name)
+            if index is None:
+                entry = entry_from_row(row, None)
+                if entry is not None:
+                    added.append(entry)
+            else:
+                replaced[index] = entry_from_row(row, saved_entries[index])
+        merged = [replaced.get(index, entry) for index, entry in enumerate(saved_entries)]
+        return merged + added
+
     def build_config_from_form(self) -> dict:
-        monitor_bindings = []
-        for row in self.monitor_rows:
-            if not row.get("switchable", True):
-                continue
-            monitor: MonitorInfo = row["monitor"]
-            hotkey = row["hotkey"].get().strip()
-            if row["enabled"].get() and hotkey and hotkey != "Press shortcut...":
-                monitor_bindings.append(
-                    {
-                        "enabled": True,
-                        "monitor": monitor.position,
-                        "device": monitor.device_name,
-                        "hotkey": hotkey,
-                        "input_a": self._combo_value(row["input_a"], 0x0F),
-                        "input_b": self._combo_value(row["input_b"], 0x1B),
-                    }
-                )
+        config = deepcopy(self.config)
+        config["version"] = 2
+        config["monitor_bindings"] = self._merge_rows(
+            config.get("monitor_bindings"), self.monitor_rows, self._binding_from_row
+        )
 
-        pc_monitors = []
-        for row in self.pc_rows:
-            monitor = row["monitor"]
-            if not row.get("switchable", True):
-                continue
-            pc_monitors.append(
-                {
-                    "enabled": row["enabled"].get(),
-                    "monitor": monitor.position,
-                    "device": monitor.device_name,
-                    "input_a": self._combo_value(row["input_a"], 0x0F),
-                    "input_b": self._combo_value(row["input_b"], 0x1B),
-                }
-            )
-
-        return {
-            "version": 2,
-            "monitor_bindings": monitor_bindings,
-            "pc_switch": {
-                "enabled": self.pc_enabled.get(),
-                "hotkey": self.pc_hotkey.get().strip(),
-                "pc_a_name": self.pc_a_name.get().strip() or "PC 1",
-                "pc_b_name": self.pc_b_name.get().strip() or "PC 2",
-                "monitors": pc_monitors,
-            },
-            # Keep Mac/PC Stream Deck handoff settings across UI saves.
-            "streamdeck_hub": deepcopy(
-                self.config.get("streamdeck_hub") or {}
+        pc_switch = config.get("pc_switch")
+        if not isinstance(pc_switch, dict):
+            pc_switch = {}
+        pc_switch.update(
+            enabled=self.pc_enabled.get(),
+            hotkey=self._hotkey_value(self.pc_hotkey, pc_switch.get("hotkey", "")),
+            pc_a_name=self.pc_a_name.get().strip() or "PC 1",
+            pc_b_name=self.pc_b_name.get().strip() or "PC 2",
+            monitors=self._merge_rows(
+                pc_switch.get("monitors"), self.pc_rows, self._pc_entry_from_row
             ),
-        }
+        )
+        config["pc_switch"] = pc_switch
+        return config
 
     def save(self) -> None:
         try:

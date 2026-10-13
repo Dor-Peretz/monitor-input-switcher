@@ -5,7 +5,15 @@ from __future__ import annotations
 
 import sys
 
-_CLI_COMMANDS = frozenset({"list", "init", "ui", "toggle", "run"})
+_CLI_COMMANDS = frozenset({"list", "init", "ui", "toggle", "run", "layout"})
+_CLI_OPTIONS = frozenset({"--config", "-h", "--help"})
+
+
+def _is_cli(args: list[str]) -> bool:
+    if not args:
+        return False
+    first = args[0]
+    return first in _CLI_COMMANDS or first.split("=", 1)[0] in _CLI_OPTIONS
 
 
 def main() -> None:
@@ -17,7 +25,7 @@ def main() -> None:
         ui_main()
         return
 
-    if args and args[0] in _CLI_COMMANDS:
+    if _is_cli(args):
         from monitor_switcher import main as cli_main
 
         raise SystemExit(cli_main(args))
