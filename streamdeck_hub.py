@@ -71,6 +71,13 @@ _CLAIM_RETRY_WINDOW = 30.0
 _PEER_CLAIM_TIMEOUT = _CLAIM_RETRY_WINDOW + 6 * _CLIENT_TIMEOUT + 10
 _PEER_RELEASE_TIMEOUT = 30
 _HANDOFF_SETTLE = 30.0
+# After a VirtualHere attach, give Elgato this long to notice the USB device
+# before quitting it. Quitting a Stream Deck that already shows the deck is
+# what forces a manual reopen on every Mac/PC switch.
+_ELGATO_APPEAR_WAIT = 8.0
+# The computer that just received the deck may restart Elgato and drop its
+# hub for a few seconds. That gap is not the computer turning off.
+_HANDOFF_QUIET = 45.0
 _MAX_BODY = 4096
 # The plugin records whether Elgato shows a Stream Deck. A deck VirtualHere
 # gives this computer that Elgato never shows has dead keys, so the watchdog
@@ -293,9 +300,14 @@ def _restart_streamdeck_soon() -> None:
             thread.start()
             _restart_threads.append(thread)
         elif sys.platform == "darwin":
+            # `open` while Elgato is still quitting only focuses the dying app,
+            # so wait for the process to be gone before reopening it.
             script = (
                 'sleep 2; '
                 'osascript -e \'quit app "Elgato Stream Deck"\' >/dev/null 2>&1; '
+                'i=0; while pgrep -xq "Stream Deck" && [ $i -lt 30 ]; do '
+                'sleep 0.5; i=$((i+1)); done; '
+                'pkill -x "Stream Deck" >/dev/null 2>&1; '
                 'sleep 1; '
                 'open -a "Elgato Stream Deck"'
             )
@@ -372,18 +384,51 @@ def _wait_for_restart(timeout: float) -> None:
         thread.join(max(0.0, deadline - time.monotonic()))
 
 
+def _elgato_seen_since(since: float) -> bool:
+    """True when the plugin reported a deck at or after ``since`` (``time.time()``)."""
+    data = _read_json(ELGATO_FILE)
+    try:
+        at = float(data.get("at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(data.get("connected")) and at >= since
+
+
+def _restart_if_elgato_missing(since: float) -> None:
+    """Quit Elgato only when this attach never showed up in the app."""
+    deadline = time.monotonic() + _ELGATO_APPEAR_WAIT
+    while True:
+        if _elgato_seen_since(since):
+            _log("Elgato already shows the Stream Deck; leaving it open.")
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    _log("Elgato did not show the Stream Deck after the claim; restarting it.")
+    _restart_streamdeck_soon()
+
+
+def _hold_auto_claim(seconds: float) -> None:
+    """Pause power-follow claims so a peer Elgato restart is not 'computer off'."""
+    global _auto_claim_blocked_until
+    until = time.monotonic() + seconds
+    if until > _auto_claim_blocked_until:
+        _auto_claim_blocked_until = until
+
+
 def claim_local() -> str:
     """Take the Stream Deck on this computer."""
     settings = hub_settings()
     last_error: Exception | None = None
     started = time.monotonic()
     sent_use = False
+    attached_at = 0.0
     for attempt in range(1, _CLAIM_ATTEMPTS + 1):
         deck = _disable_auto_use(_find_deck(settings), settings)
         if deck["in_use_by_me"] and not deck["auto_use"]:
             if sent_use:
                 # USE timed out but went through: still a fresh attach.
-                _restart_streamdeck_soon()
+                _restart_if_elgato_missing(attached_at or time.time())
                 return f"claimed {deck['name']}"
             if elgato_driving() is False:
                 _restart_streamdeck_soon()
@@ -391,11 +436,11 @@ def claim_local() -> str:
             return f"already on this computer ({deck['name']})"
         try:
             sent_use = True
+            attached_at = time.time()
             _run_client(f"USE,{deck['address']}", settings)
             deck = _find_deck(settings)
             if deck["in_use_by_me"]:
-                # Fresh USB attach: Elgato will not see the deck until restarted.
-                _restart_streamdeck_soon()
+                _restart_if_elgato_missing(attached_at)
                 return f"claimed {deck['name']}"
             last_error = RuntimeError("USE returned but device is not in use by this computer")
         except Exception as exc:
@@ -1429,6 +1474,7 @@ def toggle_deck_owner(target: str | None = None) -> str:
         )
     try:
         if sending_away:
+            _hold_auto_claim(_HANDOFF_QUIET)
             local = release_local()
             status, peer = _post_peer("/claim", _PEER_CLAIM_TIMEOUT)
             if status == "uncertain":
