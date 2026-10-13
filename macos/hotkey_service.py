@@ -12,8 +12,10 @@ for global hotkeys to fire.
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from pynput import keyboard
@@ -333,6 +335,34 @@ def build_registered_hotkeys(
     return registered
 
 
+def _progress_module():
+    lib = (
+        Path(__file__).resolve().parent
+        / "streamdeck"
+        / "com.dorperetz.monitorswitcher.sdPlugin"
+    )
+    folder = str(lib)
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
+    import switch_progress
+
+    return switch_progress
+
+
+def _begin_hotkey_progress(kind: str) -> str:
+    try:
+        return _progress_module().begin_hotkey_progress(kind)
+    except Exception:
+        return ""
+
+
+def _end_hotkey_progress(token: str) -> None:
+    try:
+        _progress_module().end_progress(token)
+    except Exception:
+        pass
+
+
 class HotkeyService:
     def __init__(self) -> None:
         self._listener: keyboard.GlobalHotKeys | None = None
@@ -458,11 +488,15 @@ class HotkeyService:
                 action = self._job_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            token = _begin_hotkey_progress(action.kind)
             try:
                 lines = action.callback()
                 self._event_queue.put(lines)
             except Exception as exc:
                 self._event_queue.put([f"Error: {exc}"])
+            finally:
+                if token:
+                    _end_hotkey_progress(token)
 
 
 def run_toggle_cli(

@@ -20,8 +20,22 @@ from ddc_monitor import enumerate_monitors, toggle_pc_group
 from startup_manage import disable_startup, enable_startup, is_startup_enabled
 
 APP_DIR = Path(__file__).resolve().parent
+_PLUGIN_LIB = (
+    APP_DIR / "streamdeck" / "com.dorperetz.monitorswitcher.sdPlugin"
+)
+if str(_PLUGIN_LIB) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_LIB))
+from switch_progress import (  # noqa: E402
+    begin_progress,
+    end_progress,
+    menu_title,
+    other_pc_name,
+    read_progress,
+)
+
 UI_SCRIPT = APP_DIR / "ui.py"
 LOG_FILE = APP_DIR / "tray.log"
+_IDLE_TITLE = "\u21c6"
 
 
 def log(message: str) -> None:
@@ -34,7 +48,7 @@ def log(message: str) -> None:
 
 class MenuBarApp(rumps.App):
     def __init__(self) -> None:
-        super().__init__("\u21c6", quit_button=None)  # ⇄ in the menu bar
+        super().__init__(_IDLE_TITLE, quit_button=None)  # ⇄ in the menu bar
         # Native Carbon global hotkeys (RegisterEventHotKey). Must be created and
         # start()ed on the main thread, which __init__ / rumps callbacks are.
         self.service = CarbonHotKeyManager()
@@ -75,10 +89,28 @@ class MenuBarApp(rumps.App):
 
     def switch_now(self, _sender=None) -> None:
         # Run the DDC switch on a thread so the blocking subprocess work does
-        # not freeze the menu / run loop.
-        threading.Thread(target=self._do_switch, daemon=True).start()
+        # not freeze the menu / run loop. The menu bar title counts seconds
+        # until that thread clears the progress flag.
+        config = load_config()
+        pc = config.get("pc_switch", {})
+        monitor_cfgs = [
+            entry
+            for entry in pc.get("monitors", [])
+            if entry.get("enabled", True)
+        ]
+        if not monitor_cfgs:
+            self._notify(
+                "Monitor Input Switcher",
+                "No PC-switch monitors configured. Open settings first.",
+            )
+            return
+        token = begin_progress(other_pc_name(), "monitors")
+        self._apply_switch_title()
+        threading.Thread(
+            target=self._do_switch, args=(token,), daemon=True
+        ).start()
 
-    def _do_switch(self) -> None:
+    def _do_switch(self, token: str = "") -> None:
         try:
             config = load_config()
             pc = config.get("pc_switch", {})
@@ -107,6 +139,9 @@ class MenuBarApp(rumps.App):
         except Exception as exc:
             log(f"Switch now failed: {exc}")
             self._notify("Switch failed", str(exc))
+        finally:
+            if token:
+                end_progress(token)
 
     def open_settings(self, _sender=None) -> None:
         subprocess.Popen(
@@ -134,6 +169,7 @@ class MenuBarApp(rumps.App):
 
     @rumps.timer(0.4)
     def _poll(self, _timer) -> None:
+        self._apply_switch_title()
         for error in self.service.poll_errors():
             self._notify("Hotkey error", error)
             log(f"Hotkey error: {error}")
@@ -157,6 +193,18 @@ class MenuBarApp(rumps.App):
             self._notify("Monitor Input Switcher", "Config changed — reloaded.")
 
     # -- helpers ---------------------------------------------------------- #
+
+    def _apply_switch_title(self) -> None:
+        progress = read_progress()
+        if progress is None:
+            title = _IDLE_TITLE
+        else:
+            title = menu_title(
+                str(progress.get("target") or ""),
+                int(progress.get("elapsed") or 0),
+            )
+        if self.title != title:
+            self.title = title
 
     def _notify(self, title: str, message: str) -> None:
         try:

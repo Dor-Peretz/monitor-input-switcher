@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ctypes
 import queue
+import sys
 import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from config_store import load_config
@@ -223,6 +225,35 @@ def build_registered_hotkeys(
     return registered
 
 
+def _switch_progress():
+    lib = (
+        Path(__file__).resolve().parent
+        / "macos"
+        / "streamdeck"
+        / "com.dorperetz.monitorswitcher.sdPlugin"
+    )
+    folder = str(lib)
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
+    import switch_progress
+
+    return switch_progress
+
+
+def _begin_hotkey_progress(action: HotkeyAction) -> str:
+    try:
+        return _switch_progress().begin_hotkey_progress(action.kind)
+    except Exception:
+        return ""
+
+
+def _end_hotkey_progress(token: str) -> None:
+    try:
+        _switch_progress().end_progress(token)
+    except Exception:
+        pass
+
+
 class HotkeyService:
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
@@ -311,11 +342,15 @@ class HotkeyService:
                             for item in self._registered
                             if item[0] == msg.wParam
                         )
+                        token = _begin_hotkey_progress(action)
                         try:
                             lines = action.callback()
                             self._event_queue.put(lines)
                         except Exception as exc:
                             self._event_queue.put([f"Error: {exc}"])
+                        finally:
+                            if token:
+                                _end_hotkey_progress(token)
                     user32.TranslateMessage(ctypes.byref(msg))
                     user32.DispatchMessageW(ctypes.byref(msg))
                 time.sleep(0.05)

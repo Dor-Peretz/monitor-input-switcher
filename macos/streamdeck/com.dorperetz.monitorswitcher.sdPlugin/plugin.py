@@ -35,6 +35,13 @@ from ddc_monitor import (  # noqa: E402
     toggle_pc_group,
 )
 from sdclient import StreamDeckClient  # noqa: E402
+from switch_progress import (  # noqa: E402
+    begin_progress,
+    end_progress,
+    other_pc_name,
+    read_progress,
+    switch_title,
+)
 
 ACTION_PC_SWITCH = "com.dorperetz.monitorswitcher.pcswitch"
 ACTION_INPUT = "com.dorperetz.monitorswitcher.input"
@@ -219,12 +226,21 @@ class Plugin:
         self.signatures: dict[str, str] = {}
         self.jobs: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         self._stop = threading.Event()
+        self._paint_lock = threading.RLock()
+        # Keys currently showing the in-progress timer. Refresh must not
+        # paint the settled title over them.
+        self._progress_contexts: set[str] = set()
+        self._progress_imaged: set[str] = set()
+        self._progress_state: dict[str, int] = {}
 
     # -- lifecycle -------------------------------------------------------- #
 
     def start_workers(self) -> None:
         threading.Thread(target=self._worker_loop, daemon=True).start()
         threading.Thread(target=self._refresh_loop, daemon=True).start()
+        threading.Thread(
+            target=self._progress_loop, name="switch-timer", daemon=True
+        ).start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -328,8 +344,14 @@ class Plugin:
         return state, f"{label}\n{input_name(last)}"
 
     def refresh_context(self, context: str) -> None:
+        with self._paint_lock:
+            self._refresh_context_body(context)
+
+    def _refresh_context_body(self, context: str) -> None:
         entry = self.contexts.get(context)
         if not entry:
+            return
+        if context in self._progress_contexts:
             return
         try:
             if entry["action"] == ACTION_PC_SWITCH:
@@ -356,6 +378,144 @@ class Plugin:
         for context in list(self.contexts):
             self.refresh_context(context)
 
+    def _progress_loop(self) -> None:
+        """Tick the on-key timer until the switch that published it finishes."""
+        while not self._stop.wait(0.5):
+            try:
+                self._paint_progress()
+            except Exception as exc:  # keep the countdown alive no matter what
+                log(f"Switch timer error: {exc}")
+
+    def _paint_progress(self) -> None:
+        with self._paint_lock:
+            progress = read_progress()
+            if not progress:
+                self._clear_progress_faces()
+                return
+            contexts = self._contexts_for_progress(progress)
+            title = switch_title(
+                str(progress.get("target") or ""),
+                int(progress.get("elapsed") or 0),
+            )
+            seen = set(contexts)
+            stale = [item for item in self._progress_contexts if item not in seen]
+            self._progress_contexts = seen
+            for context in stale:
+                self._forget_progress_face(context)
+                self._refresh_context_body(context)
+            for context in contexts:
+                self._paint_progress_key(context, title)
+
+    def _clear_progress_faces(self) -> None:
+        if not self._progress_contexts:
+            return
+        stale = list(self._progress_contexts)
+        self._progress_contexts = set()
+        self._progress_imaged.clear()
+        self._progress_state.clear()
+        for context in stale:
+            self.signatures.pop(context, None)
+            self._refresh_context_body(context)
+
+    def _forget_progress_face(self, context: str) -> None:
+        self._progress_imaged.discard(context)
+        self._progress_state.pop(context, None)
+        self.signatures.pop(context, None)
+
+    def _contexts_for_progress(self, progress: dict) -> list[str]:
+        kind = str(progress.get("kind") or "")
+        origin = str(progress.get("origin") or "")
+        if kind == "input":
+            return [origin] if origin in self.contexts else []
+        if kind == "deck":
+            actions = {ACTION_DECK}
+        elif kind == "monitors":
+            actions = {ACTION_PC_SWITCH, ACTION_INPUT}
+        else:
+            return []
+        return [
+            context
+            for context, entry in self.contexts.items()
+            if entry.get("action") in actions
+        ]
+
+    def _paint_progress_key(self, context: str, title: str) -> None:
+        entry = self.contexts.get(context)
+        if not entry:
+            return
+        action = entry.get("action") or ACTION_INPUT
+        if context not in self._progress_state:
+            self._progress_state[context] = self._shown_state(context)
+        state = self._progress_state[context]
+        signature = f"busy|{title}|{state}|{action}"
+        if self.signatures.get(context) == signature:
+            return
+        if context not in self._progress_imaged:
+            self._send_key_face(context, state, title, action)
+            self._progress_imaged.add(context)
+        else:
+            self._send_titles(context, title)
+        self.signatures[context] = signature
+
+    def _shown_state(self, context: str) -> int:
+        signature = self.signatures.get(context) or ""
+        if signature.startswith("busy|"):
+            state = signature.rsplit("|", 2)
+            if len(state) == 3 and state[1].isdigit():
+                return int(state[1])
+        head = signature.split("|", 1)[0]
+        if head.isdigit():
+            return int(head)
+        return 0
+
+    def _start_progress(self, context: str, action: str, settings: dict) -> str:
+        try:
+            target, kind = self._progress_label(action, settings)
+        except Exception as exc:
+            log(f"Switch label failed: {exc}")
+            target = ""
+            kind = "deck" if action == ACTION_DECK else "monitors"
+        origin = context if kind == "input" else ""
+        token = begin_progress(target, kind, origin=origin)
+        log(f"Switching to {target or kind}")
+        try:
+            self._paint_progress()
+        except Exception as exc:
+            log(f"Switch timer failed: {exc}")
+        return token
+
+    def _progress_label(self, action: str, settings: dict) -> tuple[str, str]:
+        if action == ACTION_DECK:
+            from streamdeck_hub import displayed_owner, owner_name
+
+            previous = displayed_owner()
+            target = "b" if previous == "a" else "a"
+            return owner_name(target), "deck"
+        if action == ACTION_PC_SWITCH:
+            return other_pc_name(), "monitors"
+        return self._input_target_name(settings), "input"
+
+    def _input_target_name(self, settings: dict) -> str:
+        """Input A is the Mac (blue). Input B is the PC (green)."""
+        config = load_config()
+        binding = find_binding(config, settings.get("target", ""))
+        if binding is None:
+            return ""
+        state_key = binding.get("device") or ""
+        last = read_last_input(state_key) if state_key else None
+        try:
+            input_a = parse_input_value(binding.get("input_a"))
+        except (TypeError, ValueError):
+            input_a = None
+        # toggle_input moves A -> B, B -> A, and an unknown input to B.
+        if last is None or (input_a is not None and last == input_a):
+            return "PC"
+        return "Mac"
+
+    def _finish_progress(self, token: str) -> None:
+        end_progress(token)
+        self._paint_progress()
+
     def _refresh_loop(self) -> None:
         while not self._stop.wait(REFRESH_SECONDS):
             try:
@@ -374,22 +534,37 @@ class Plugin:
             entry = self.contexts.get(context)
             if not entry:
                 continue
+            action = entry.get("action")
+            settings = settings or entry.get("settings") or {}
+            token = ""
+            if action in (ACTION_PC_SWITCH, ACTION_DECK, ACTION_INPUT):
+                try:
+                    token = self._start_progress(context, action, settings)
+                except Exception as exc:
+                    log(f"Switch timer failed: {exc}")
             try:
-                if entry["action"] == ACTION_PC_SWITCH:
+                if action == ACTION_PC_SWITCH:
                     self._do_pc_switch()
-                elif entry["action"] == ACTION_DECK:
+                elif action == ACTION_DECK:
                     self._do_deck_switch()
-                elif entry["action"] == ACTION_WAKE:
-                    self._do_wake(settings or entry["settings"])
+                elif action == ACTION_WAKE:
+                    self._do_wake(settings)
                 else:
-                    self._do_input_toggle(settings or entry["settings"])
+                    self._do_input_toggle(settings)
                 self.client.send("showOk", context=context)
             except Exception as exc:
                 log(f"Switch failed: {exc}")
                 self.client.send("showAlert", context=context)
             finally:
+                if token:
+                    try:
+                        self._finish_progress(token)
+                    except Exception as exc:
+                        log(f"Switch timer failed: {exc}")
                 self.monitors.invalidate()
-                self.signatures.pop(context, None)
+                with self._paint_lock:
+                    if context not in self._progress_contexts:
+                        self.signatures.pop(context, None)
                 self.refresh_all()
 
     def _remember_key(self, context: str | None, action: str | None, payload: dict) -> None:
@@ -453,30 +628,24 @@ class Plugin:
                 )
         self.client.send("setState", context=context, payload={"state": state})
 
-    def _show_deck(self, owner: str) -> None:
-        from streamdeck_hub import owner_name, write_selected
-
-        write_selected(owner)
-        state = 0 if owner == "a" else 1
-        title = owner_name(owner)
-        image = image_for(ACTION_DECK, state)
-        for context, entry in list(self.contexts.items()):
-            if entry.get("action") != ACTION_DECK:
-                continue
-            self.signatures[context] = f"{state}|{title}|{image}"
-            self._send_key_face(context, state, title, ACTION_DECK)
+    def _send_titles(self, context: str, title: str) -> None:
+        """Update the timer text without resending the key image."""
+        for face in (0, 1):
+            for target in (0, 2):
+                self.client.send(
+                    "setTitle",
+                    context=context,
+                    payload={"title": title, "target": target, "state": face},
+                )
 
     def _do_deck_switch(self) -> None:
         from streamdeck_hub import displayed_owner, toggle_deck_owner
 
         previous = displayed_owner()
         target = "b" if previous == "a" else "a"
-        try:
-            note = toggle_deck_owner(target)
-        except Exception:
-            self._show_deck(previous)
-            raise
-        self._show_deck(target)
+        # The key keeps its current icon and shows the timer until this
+        # returns. Refresh after the handoff paints whoever actually has it.
+        note = toggle_deck_owner(target)
         log(f"Deck switch -> {note}")
 
     def _do_wake(self, settings: dict) -> None:

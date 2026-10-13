@@ -1,6 +1,8 @@
 # Runtime state
 .switcher_state.json
 switcher_state.json
+.switch_progress.json
+.switch_progress.json.tmp
 deck_selection.json
 peer_seen.json
 peer_wake.json

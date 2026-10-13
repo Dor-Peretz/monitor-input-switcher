@@ -29,7 +29,9 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import queue
+import sys
 import threading
+from pathlib import Path
 from typing import Callable
 
 from config_store import load_config
@@ -39,6 +41,15 @@ from hotkey_service import (
     build_registered_hotkeys,
     parse_hotkey_spec,
 )
+
+_PLUGIN_LIB = (
+    Path(__file__).resolve().parent
+    / "streamdeck"
+    / "com.dorperetz.monitorswitcher.sdPlugin"
+)
+if str(_PLUGIN_LIB) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_LIB))
+from switch_progress import begin_hotkey_progress, end_progress  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Carbon.framework bindings (ctypes)
@@ -331,11 +342,18 @@ class CarbonHotKeyManager:
                 action = self._job_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            token = begin_hotkey_progress(action.kind)
             try:
                 lines = action.callback()
                 self._event_queue.put(lines)
             except Exception as exc:
                 self._event_queue.put([f"Error: {exc}"])
+            finally:
+                if token:
+                    try:
+                        end_progress(token)
+                    except Exception:
+                        pass
 
     def poll_events(self) -> list[list[str]]:
         events: list[list[str]] = []
