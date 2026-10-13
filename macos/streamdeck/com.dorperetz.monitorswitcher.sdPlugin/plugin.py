@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import queue
 import sys
 import threading
@@ -51,6 +52,10 @@ ACTION_WAKE = "com.dorperetz.monitorswitcher.wake"
 
 LOG_FILE = APP_DIR / "streamdeck.log"
 REFRESH_SECONDS = 1.5
+# Must stay well under streamdeck_hub._ELGATO_STALE.
+ELGATO_NOTE_SECONDS = 5.0
+# Stream Deck Mobile (3) and the virtual Stream Deck (11) are not the USB deck.
+_SOFTWARE_DECK_TYPES = {3, 11}
 # Enumeration shells out to m1ddc, so keep it off the refresh path.
 MONITOR_CACHE_SECONDS = 30.0
 
@@ -61,6 +66,17 @@ def log(message: str) -> None:
             handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
     except OSError:
         pass
+
+
+def is_hardware_deck(info: object) -> bool:
+    """A physical Stream Deck in Elgato's device info, not Mobile or virtual."""
+    if not isinstance(info, dict):
+        return False
+    try:
+        kind = int(info.get("type", 0))
+    except (TypeError, ValueError):
+        kind = 0
+    return kind not in _SOFTWARE_DECK_TYPES
 
 
 class MonitorCache:
@@ -230,6 +246,8 @@ class Plugin:
         self._paint_lock = threading.RLock()
         # Keys currently showing the in-progress timer. Refresh must not
         # paint the settled title over them.
+        self._elgato_devices: set[str] = set()
+        self._elgato_noted_at = 0.0
         self._progress_contexts: set[str] = set()
         self._progress_imaged: set[str] = set()
         self._progress_state: dict[str, int] = {}
@@ -257,6 +275,15 @@ class Plugin:
         context = message.get("context")
         action = message.get("action")
         payload = message.get("payload") or {}
+        if event in ("deviceDidConnect", "deviceDidDisconnect"):
+            device = str(message.get("device") or "")
+            if event == "deviceDidConnect" and is_hardware_deck(message.get("deviceInfo")):
+                self._elgato_devices.add(device)
+            else:
+                self._elgato_devices.discard(device)
+            log(f"Elgato {event[6:]}: {len(self._elgato_devices)} deck(s)")
+            self._note_elgato(force=True)
+            return
         if event == "keyDown":
             if context:
                 self._remember_key(context, action, payload)
@@ -533,10 +560,34 @@ class Plugin:
 
     def _refresh_loop(self) -> None:
         while not self._stop.wait(REFRESH_SECONDS):
+            self._note_elgato()
             try:
                 self.refresh_all()
             except Exception as exc:  # keep the key display alive no matter what
                 log(f"Refresh loop error: {exc}")
+
+    def load_devices(self, info: str) -> None:
+        """Decks Elgato already showed when it started this plugin (``-info``)."""
+        try:
+            devices = json.loads(info or "{}").get("devices") or []
+        except (ValueError, AttributeError):
+            devices = []
+        for device in devices:
+            if isinstance(device, dict) and is_hardware_deck(device):
+                self._elgato_devices.add(str(device.get("id") or ""))
+
+    def _note_elgato(self, force: bool = False) -> None:
+        """Tell the hub whether Elgato shows a deck; its watchdog acts on this."""
+        now = time.monotonic()
+        if not force and now - self._elgato_noted_at < ELGATO_NOTE_SECONDS:
+            return
+        self._elgato_noted_at = now
+        try:
+            from streamdeck_hub import note_elgato_deck
+
+            note_elgato_deck(bool(self._elgato_devices))
+        except Exception as exc:
+            log(f"Could not record Elgato devices: {exc}")
 
     # -- switching -------------------------------------------------------- #
 
@@ -740,6 +791,7 @@ def main() -> int:
 
     client = StreamDeckClient(args.port, args.plugin_uuid, args.register_event)
     plugin = Plugin(client)
+    plugin.load_devices(args.info)
     try:
         client.connect()
         plugin.start_workers()

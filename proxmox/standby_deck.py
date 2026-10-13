@@ -3,8 +3,10 @@
 
 VirtualHere is configured with AutoAttachToKernel, so when neither the Mac
 nor the PC is using the deck it reappears here as a HID device. This draws
-Turn on Mac, Turn on PC, and the Home Assistant folder. When a computer
-claims the deck, the device disappears and this waits until it returns.
+Mac, PC, and the Home Assistant folder. The Mac and PC keys hand the deck to
+that computer when its hub answers, and send Wake-on-LAN when it does not.
+When a computer claims the deck, the device disappears and this waits until
+it returns.
 
 No third-party packages. Home Assistant address and token, and the wake
 addresses, come from config.json next to this file. That file stays on the
@@ -13,14 +15,18 @@ host and is not part of the git tree.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import select
 import socket
 import subprocess
+import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
@@ -31,6 +37,8 @@ VENDOR = "0fd9"
 PRODUCT = "0080"
 IMAGE_REPORT_LENGTH = 1024
 IMAGE_HEADER_LENGTH = 8
+HUB_PORT = 8765
+HUB_RESCAN_SECONDS = 600.0
 
 # Same Home Assistant folder as the Elgato profile. column, row.
 HA_KEYS = {
@@ -169,6 +177,15 @@ def lan_broadcasts(extra: str) -> list[str]:
     extra = str(extra or "").strip()
     if extra and extra not in found:
         found.append(extra)
+    for iface in lan_interfaces():
+        brd = str(iface.network.broadcast_address)
+        if brd not in found:
+            found.append(brd)
+    return found
+
+
+def _ip_addr_lines() -> list[list[str]]:
+    """``ip -4 -o addr show``, one split line per address."""
     try:
         out = subprocess.check_output(
             ["ip", "-4", "-o", "addr", "show"],
@@ -176,15 +193,144 @@ def lan_broadcasts(extra: str) -> list[str]:
             timeout=2,
         )
     except (OSError, subprocess.SubprocessError):
-        return found
-    for line in out.splitlines():
-        parts = line.split()
-        if "brd" not in parts:
+        return []
+    return [line.split() for line in out.splitlines()]
+
+
+def lan_interfaces() -> list[ipaddress.IPv4Interface]:
+    """This host's private LAN addresses, /22 to /30.
+
+    Proxmox bridges often print no ``brd``, so the subnet comes from the
+    address prefix itself.
+    """
+    found: list[ipaddress.IPv4Interface] = []
+    for parts in _ip_addr_lines():
+        if "inet" not in parts:
             continue
-        brd = parts[parts.index("brd") + 1]
-        if brd and brd != "0.0.0.0" and brd not in found:
-            found.append(brd)
+        try:
+            iface = ipaddress.ip_interface(parts[parts.index("inet") + 1])
+        except (ValueError, IndexError):
+            continue
+        network = iface.network
+        if iface.ip.is_loopback or not network.is_private:
+            continue
+        if 22 <= network.prefixlen <= 30 and iface not in found:
+            found.append(iface)
     return found
+
+
+def lan_hosts() -> list[str]:
+    """Every other address on this host's private LANs."""
+    hosts: list[str] = []
+    for iface in lan_interfaces():
+        for host in iface.network.hosts():
+            text = str(host)
+            if host != iface.ip and text not in hosts:
+                hosts.append(text)
+    return hosts
+
+
+def probe_hub(host: str, timeout: float = 1.0) -> str:
+    """``a`` or ``b`` when a monitor-switcher hub answers on ``host``, else ``""``."""
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{HUB_PORT}/health", timeout=timeout
+        ) as response:
+            data = json.loads(response.read(4096).decode("utf-8", errors="replace"))
+    except Exception:
+        return ""
+    side = str(data.get("local_pc") or "") if isinstance(data, dict) else ""
+    return side if side in ("a", "b") else ""
+
+
+def _hub_port_open(host: str) -> bool:
+    try:
+        with socket.create_connection((host, HUB_PORT), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
+class HubFinder:
+    """Finds the Mac and PC hubs on the LAN so a key can hand them the deck."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.urls = {"a": "", "b": ""}
+        self.fixed = {"a": False, "b": False}
+        self.token = ""
+        self._scanning = False
+        self._scanned_at = 0.0
+
+    def configure(self, config: dict) -> None:
+        with self._lock:
+            self.token = str(config.get("hub_token") or "")
+            for side in ("a", "b"):
+                url = str(config.get(f"hub_{side}_url") or "").strip().rstrip("/")
+                self.fixed[side] = bool(url)
+                if url:
+                    self.urls[side] = url
+
+    def url(self, side: str) -> str:
+        with self._lock:
+            return self.urls.get(side, "")
+
+    def rescan(self, force: bool = False) -> None:
+        with self._lock:
+            if all(self.fixed.values()) or self._scanning:
+                return
+            if not force and time.monotonic() - self._scanned_at < HUB_RESCAN_SECONDS:
+                return
+            self._scanning = True
+        threading.Thread(target=self._scan, name="hub-scan", daemon=True).start()
+
+    def _scan(self) -> None:
+        found: dict[str, str] = {}
+        try:
+            hosts = lan_hosts()
+            with ThreadPoolExecutor(max_workers=64) as pool:
+                open_hosts = [
+                    host
+                    for host, is_open in zip(hosts, pool.map(_hub_port_open, hosts))
+                    if is_open
+                ]
+            for host in open_hosts:
+                side = probe_hub(host)
+                if side and side not in found:
+                    found[side] = f"http://{host}:{HUB_PORT}"
+        except Exception as exc:
+            log(f"hub scan failed: {exc}")
+        with self._lock:
+            for side, url in found.items():
+                if not self.fixed[side] and self.urls[side] != url:
+                    self.urls[side] = url
+                    log(f"found {'Mac' if side == 'a' else 'PC'} hub at {url}")
+            self._scanned_at = time.monotonic()
+            self._scanning = False
+
+    def hand_deck_to(self, side: str) -> bool:
+        """Ask that computer to take the deck. False when it does not answer."""
+        url = self.url(side)
+        host = url.split("//", 1)[-1].split(":", 1)[0] if url else ""
+        if not host or probe_hub(host) != side:
+            self.rescan(force=True)
+            return False
+        request = urllib.request.Request(f"{url}/claim", data=b"", method="POST")
+        with self._lock:
+            if self.token:
+                request.add_header("X-Hub-Token", self.token)
+
+        def send() -> None:
+            try:
+                # The claim detaches the deck from this host; the reply may
+                # come long after, or never if the computer is slow.
+                with urllib.request.urlopen(request, timeout=180) as response:
+                    log(f"claim reply: {response.read(200).decode('utf-8', 'replace')}")
+            except Exception as exc:
+                log(f"claim request to {url} failed: {exc}")
+
+        threading.Thread(target=send, name="hub-claim", daemon=True).start()
+        return True
 
 
 def send_wol(mac: str, broadcast: str) -> None:
@@ -258,9 +404,13 @@ def entity_is_on(state: str) -> bool:
 
 
 class Screen:
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, hubs: HubFinder) -> None:
         self.config = config
+        self.hubs = hubs
         self.page = "main"
+        self.dirty = False
+        self._fetching = False
+        self._states_lock = threading.Lock()
         self.blank = load_jpeg("blank")
         self.images = {
             "main-mac": load_jpeg("main-mac"),
@@ -281,27 +431,45 @@ class Screen:
         return {key_index(col, row): spec for (col, row), spec in source.items()}
 
     def refresh_states(self) -> None:
+        """Fetch Home Assistant states off the key loop; sets ``dirty`` on change."""
         if self.page != "ha":
             return
-        if time.monotonic() - self.states_at < 3:
-            return
+        with self._states_lock:
+            if self._fetching or time.monotonic() - self.states_at < 3:
+                return
+            self._fetching = True
+            self.states_at = time.monotonic()
+        threading.Thread(target=self._fetch_states, name="ha-states", daemon=True).start()
+
+    def _fetch_states(self) -> None:
         entities = []
         for spec in HA_KEYS.values():
             entity = spec.get("state")
             if entity and entity not in entities:
                 entities.append(entity)
-        self.states = ha_states(self.config, entities)
-        self.states_at = time.monotonic()
+        states: dict[str, str] = {}
+        try:
+            states = ha_states(self.config, entities)
+        finally:
+            with self._states_lock:
+                if states != self.states:
+                    self.states = states
+                    self.dirty = True
+                self.states_at = time.monotonic()
+                self._fetching = False
 
     def image_for(self, spec: dict) -> bytes:
         name = spec["image"]
         entity = spec.get("state")
         if entity:
-            suffix = "on" if entity_is_on(self.states.get(entity, "")) else "off"
+            with self._states_lock:
+                state = self.states.get(entity, "")
+            suffix = "on" if entity_is_on(state) else "off"
             return self.images[f"{name}-{suffix}"]
         return self.images[name]
 
     def paint(self, fd: int) -> None:
+        self.dirty = False
         self.refresh_states()
         layout = self.layout()
         for index in range(15):
@@ -319,10 +487,12 @@ class Screen:
             return f"page {self.page}"
         if spec.get("wake"):
             which = spec["wake"]
+            label = "Mac" if which == "a" else "PC"
+            if self.hubs.hand_deck_to(which):
+                return f"hand deck to {label}"
             mac = str(self.config.get(f"wol_{which}") or "")
             broadcast = str(self.config.get("wol_broadcast") or "255.255.255.255")
             send_wol(mac, broadcast)
-            label = "Mac" if which == "a" else "PC"
             return f"wake {label}"
         if spec.get("service"):
             ha_call(self.config, spec["service"], spec.get("entity"), spec.get("data"))
@@ -331,8 +501,8 @@ class Screen:
         return ""
 
 
-def run_deck(path: str, config: dict) -> None:
-    screen = Screen(config)
+def run_deck(path: str, config: dict, hubs: HubFinder) -> None:
+    screen = Screen(config, hubs)
     fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
     try:
         log(f"deck attached at {path}")
@@ -343,7 +513,8 @@ def run_deck(path: str, config: dict) -> None:
         while True:
             ready, _, _ = select.select([fd], [], [], 1.0)
             if not ready:
-                if screen.page == "ha" and time.monotonic() - screen.states_at >= 3:
+                screen.refresh_states()
+                if screen.dirty:
                     screen.paint(fd)
                 continue
             try:
@@ -378,6 +549,9 @@ def run_deck(path: str, config: dict) -> None:
 
 def main() -> None:
     log("standby screen waiting for the Stream Deck")
+    hubs = HubFinder()
+    hubs.configure(load_config())
+    hubs.rescan(force=True)
     announced = False
     while True:
         path = find_hidraw()
@@ -388,11 +562,17 @@ def main() -> None:
             time.sleep(1)
             continue
         announced = False
+        config = load_config()
+        hubs.configure(config)
+        hubs.rescan()
         try:
-            run_deck(path, load_config())
+            run_deck(path, config, hubs)
         except OSError as exc:
             log(f"deck closed ({exc})")
             time.sleep(0.5)
+        except Exception:
+            log("standby error:\n" + traceback.format_exc())
+            time.sleep(2)
 
 
 if __name__ == "__main__":

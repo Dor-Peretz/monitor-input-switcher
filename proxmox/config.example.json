@@ -3,5 +3,8 @@
   "ha_token": "",
   "wol_a": "",
   "wol_b": "",
-  "wol_broadcast": "192.168.71.255"
+  "wol_broadcast": "192.168.71.255",
+  "hub_a_url": "",
+  "hub_b_url": "",
+  "hub_token": ""
 }

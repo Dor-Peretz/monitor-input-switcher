@@ -72,6 +72,15 @@ _PEER_CLAIM_TIMEOUT = _CLAIM_RETRY_WINDOW + 6 * _CLIENT_TIMEOUT + 10
 _PEER_RELEASE_TIMEOUT = 30
 _HANDOFF_SETTLE = 30.0
 _MAX_BODY = 4096
+# The plugin records whether Elgato shows a Stream Deck. A deck VirtualHere
+# gives this computer that Elgato never shows has dead keys, so the watchdog
+# restarts Elgato and then hands the deck back to the standby screen.
+ELGATO_FILE = Path(__file__).resolve().parent / "elgato_deck.json"
+_ELGATO_STALE = 20.0
+_WATCHDOG_GRACE = 25.0
+_WATCHDOG_RETRY = 30.0
+_WATCHDOG_RESTARTS = 2
+_AUTO_CLAIM_COOLDOWN = 600.0
 # kIOMessage* from IOKit/pwr_mgt/IOPMLibDefs.h
 _IO_CAN_SLEEP = 0xE0000270
 _IO_WILL_SLEEP = 0xE0000280
@@ -354,11 +363,20 @@ def claim_local() -> str:
     settings = hub_settings()
     last_error: Exception | None = None
     started = time.monotonic()
+    sent_use = False
     for attempt in range(1, _CLAIM_ATTEMPTS + 1):
         deck = _disable_auto_use(_find_deck(settings), settings)
         if deck["in_use_by_me"] and not deck["auto_use"]:
+            if sent_use:
+                # USE timed out but went through: still a fresh attach.
+                _restart_streamdeck_soon()
+                return f"claimed {deck['name']}"
+            if elgato_driving() is False:
+                _restart_streamdeck_soon()
+                return f"already on this computer ({deck['name']}); restarted Elgato"
             return f"already on this computer ({deck['name']})"
         try:
+            sent_use = True
             _run_client(f"USE,{deck['address']}", settings)
             deck = _find_deck(settings)
             if deck["in_use_by_me"]:
@@ -381,7 +399,13 @@ def release_local() -> str:
     deck = _disable_auto_use(_find_deck(settings), settings)
     if not deck["in_use_by_me"]:
         return f"already released ({deck['name']})"
-    _run_client(f"STOP USING,{deck['address']}", settings)
+    try:
+        _run_client(f"STOP USING,{deck['address']}", settings)
+    except Exception:
+        # VirtualHere often answers late after it has already let go.
+        if _find_deck(settings)["in_use_by_me"]:
+            raise
+        return f"released {deck['name']} (VirtualHere answered late)"
     return f"released {deck['name']}"
 
 
@@ -949,9 +973,79 @@ def _follow_suspended() -> bool:
     return _suspend_follow
 
 
+def note_elgato_deck(connected: bool) -> None:
+    """Called by the plugin: whether Elgato shows a Stream Deck right now."""
+    try:
+        _write_json(ELGATO_FILE, {"connected": bool(connected), "at": time.time()})
+    except OSError as exc:
+        _log(f"Could not record Elgato state: {exc}")
+
+
+def elgato_driving() -> bool | None:
+    """True when Elgato shows the deck, False when not, None when unknown.
+
+    Unknown means the plugin has not reported lately: Elgato is not running,
+    or the plugin is not installed on this computer.
+    """
+    data = _read_json(ELGATO_FILE)
+    try:
+        at = float(data.get("at") or 0)
+    except (TypeError, ValueError):
+        at = 0.0
+    if not data or time.time() - at > _ELGATO_STALE:
+        return None
+    return bool(data.get("connected"))
+
+
+_watchdog = {"plugin_seen": False, "since": 0.0, "restarts": 0, "next": 0.0}
+_auto_claim_blocked_until = 0.0
+
+
+def _watch_elgato(settings: dict) -> None:
+    """Never leave the deck on this computer while Elgato does not show it."""
+    global _auto_claim_blocked_until
+    driving = elgato_driving()
+    if driving is not None:
+        _watchdog["plugin_seen"] = True
+    # Without a plugin report since this process started, a silent Elgato
+    # may simply mean the plugin is not installed here; do nothing then.
+    if driving or not _watchdog["plugin_seen"]:
+        _watchdog.update(since=0.0, restarts=0, next=0.0)
+        return
+    now = time.monotonic()
+    if now < _watchdog["next"]:
+        return
+    try:
+        held = _find_deck(settings)["in_use_by_me"]
+    except Exception:
+        _watchdog["next"] = now + 30.0
+        return
+    if not held:
+        _watchdog.update(since=0.0, restarts=0, next=now + 8.0)
+        return
+    if not _watchdog["since"]:
+        _watchdog.update(since=now, next=now + _WATCHDOG_GRACE)
+        return
+    if _watchdog["restarts"] < _WATCHDOG_RESTARTS:
+        _watchdog["restarts"] += 1
+        _watchdog["next"] = now + _WATCHDOG_RETRY
+        _log(
+            "Elgato does not show the Stream Deck this computer holds; "
+            f"restarting Elgato (try {_watchdog['restarts']})."
+        )
+        _restart_streamdeck_soon()
+        return
+    note = release_local()
+    _auto_claim_blocked_until = now + _AUTO_CLAIM_COOLDOWN
+    _watchdog.update(since=0.0, restarts=0, next=now + 8.0)
+    _log(f"Elgato never showed the Stream Deck; gave it back to the standby screen. {note}")
+
+
 def claim_if_alone() -> str | None:
     """Take the deck when the other computer is off and we do not hold it."""
     if _follow_suspended():
+        return None
+    if time.monotonic() < _auto_claim_blocked_until:
         return None
     settings = hub_settings()
     if not settings["enabled"] or not settings["follow_power"]:
@@ -995,7 +1089,13 @@ def _follow_loop() -> None:
         time.sleep(4)
         try:
             settings = hub_settings()
-            if not settings["enabled"] or not settings["follow_power"]:
+            if not settings["enabled"]:
+                continue
+            try:
+                _watch_elgato(settings)
+            except Exception as exc:
+                _log(f"Elgato watchdog: {exc}")
+            if not settings["follow_power"]:
                 continue
             if not resolved_peer_url(settings):
                 if time.monotonic() >= next_discover:
@@ -1348,6 +1448,7 @@ class _HubHandler(BaseHTTPRequestHandler):
         try:
             if path == "/claim":
                 message = claim_local()
+                write_selected(hub_settings()["local_pc"])
             elif path == "/release":
                 message = release_local()
             elif path == "/layout":
